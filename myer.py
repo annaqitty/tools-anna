@@ -48,7 +48,7 @@ eu-south-1
 eu-north-1
 me-south-1
 sa-east-1'''
-pid_restore = '.nero_swallowtail'
+pid_restore = '.anna'
 
 
  # Total width of the number including leading zeros
